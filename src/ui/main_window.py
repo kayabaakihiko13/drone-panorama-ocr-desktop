@@ -29,6 +29,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QTableWidget,
     QTableWidgetItem,
@@ -42,6 +43,7 @@ from src.database.db import Database
 from src.orchestrator.engine import Orchestrator, OrchestratorEvent
 from src.recognition.detector import describe_compute_plan
 from src.ui.settings_dialog import SettingsDialog
+from src.ui.toast import ElidedLabel, ToastManager
 from src.ui.video_player_dialog import VideoPlayerDialog
 from src.utils.iso6346 import validate_iso6346
 
@@ -71,6 +73,7 @@ class MainWindow(QMainWindow):
         self.resize(1300, 850)
 
         self._init_ui()
+        self._toasts = ToastManager(self.centralWidget())
         self._init_event_timer()
         self._load_jobs()
 
@@ -123,11 +126,12 @@ class MainWindow(QMainWindow):
         self.progress_bar.setMinimumWidth(260)
         top_bar.addWidget(self.progress_bar)
 
-        self.lbl_status = QLabel("Siap")
+        self.lbl_status = ElidedLabel("Siap")
         self.lbl_status.setStyleSheet("color: #0078D4; font-weight: bold;")
-        top_bar.addWidget(self.lbl_status)
-
-        top_bar.addStretch()
+        self.lbl_status.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_status.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred)
+        self.lbl_status.setMinimumWidth(0)
+        top_bar.addWidget(self.lbl_status, 1)
 
         self.btn_settings = QPushButton("Pengaturan")
         self.btn_settings.clicked.connect(self._open_settings)
@@ -309,7 +313,7 @@ class MainWindow(QMainWindow):
                 self.current_job_id = evt.job_id
                 self._clear_workspace_for_new_job()
                 self._set_start_button_state(True)
-                self.lbl_status.setText(f"Job {evt.job_id} dimulai...")
+                self.show_toast(f"Job {evt.job_id} dimulai...", "info")
                 self.progress_bar.setValue(2)
                 self.txt_activity_log.setPlainText(f"[{now_str}] === MULAI JOB {evt.job_id}: {evt.data.get('name')} ===\n")
                 self.txt_activity_log.appendPlainText(f"[{now_str}] Mode: {evt.data.get('mode')}, Sensor: {evt.data.get('camera_position')}")
@@ -335,17 +339,16 @@ class MainWindow(QMainWindow):
             elif evt.type == "JOB_COMPLETED":
                 self._set_start_button_state(False)
                 self.progress_bar.setValue(100)
-                self.lbl_status.setText("Job Selesai.")
+                self.show_toast("Job Selesai.", "success")
                 self.txt_activity_log.appendPlainText(f"[{now_str}] [SUKSES] {evt.data.get('message', 'Job selesai!')}\n")
                 self.txt_activity_log.ensureCursorVisible()
                 self._load_jobs()
                 if self.current_job_id == evt.job_id:
                     self._load_containers_for_job(evt.job_id)
-                QMessageBox.information(self, "Job Selesai", f"Job {evt.job_id} telah selesai diproses!")
             elif evt.type == "JOB_FAILED":
                 self._set_start_button_state(False)
                 self.progress_bar.setValue(0)
-                self.lbl_status.setText("Job Gagal.")
+                self.show_toast("Job Gagal.", "error")
                 self.txt_activity_log.appendPlainText(f"[{now_str}] [GAGAL] {evt.data.get('error')}\n")
                 self.txt_activity_log.ensureCursorVisible()
                 self._load_jobs()
@@ -353,11 +356,10 @@ class MainWindow(QMainWindow):
             elif evt.type == "JOB_CANCELLED":
                 self._set_start_button_state(False)
                 self.progress_bar.setValue(0)
-                self.lbl_status.setText("Proses Dibatalkan.")
+                self.show_toast("Proses Dibatalkan.", "warning")
                 self.txt_activity_log.appendPlainText(f"[{now_str}] [DIBATALKAN] {evt.data.get('message', 'Proses dibatalkan oleh pengguna.')}\n")
                 self.txt_activity_log.ensureCursorVisible()
                 self._load_jobs()
-                QMessageBox.warning(self, "Proses Dibatalkan", "Pemrosesan video telah dibatalkan.")
             elif evt.type == "MANUAL_OVERRIDE_SAVED":
                 if self.current_job_id:
                     self._load_containers_for_job(self.current_job_id)
@@ -379,7 +381,7 @@ class MainWindow(QMainWindow):
         if path:
             self.selected_video_path = path
             self.btn_new_job.setText(f"📁 {Path(path).name}")
-            self.lbl_status.setText(f"Video dipilih: {Path(path).name}")
+            self.show_toast(f"Video dipilih: {Path(path).name}", "info")
             self.btn_play_input.setEnabled(True)
 
     def _on_mode_changed(self) -> None:
@@ -722,7 +724,7 @@ class MainWindow(QMainWindow):
             "detection_id": self.selected_detection_id,
             "text": text,
         })
-        self.lbl_status.setText(f"Koreksi disimpan: {text}")
+        self.show_toast(f"Koreksi disimpan: {text}", "success")
 
     def _on_play_input_video(self) -> None:
         if not self.selected_video_path or not Path(self.selected_video_path).is_file():
@@ -902,7 +904,7 @@ class MainWindow(QMainWindow):
         if dlg.exec():
             self.cmd_queue.put({"action": "UPDATE_CONFIG", "config": self.config.to_dict()})
             dev_lbl = str(getattr(self.config.stitching, "device", "cpu")).upper()
-            self.lbl_status.setText(f"Pengaturan berhasil disimpan (Mode Komputasi: {dev_lbl}).")
+            self.show_toast(f"Pengaturan berhasil disimpan (Mode Komputasi: {dev_lbl}).", "success")
 
     def _on_logout(self) -> None:
         reply = QMessageBox.question(
@@ -921,9 +923,17 @@ class MainWindow(QMainWindow):
             dlg = LoginDialog(self.config, self)
             if dlg.exec() == LoginDialog.DialogCode.Accepted:
                 self.show()
-                self.lbl_status.setText("Berhasil masuk dengan akun baru.")
+                self.show_toast("Berhasil masuk dengan akun baru.", "info")
             else:
                 self.close()
+
+    def show_toast(self, message: str, level: str = "info", duration_ms: int = 4000) -> None:
+        self._toasts.show(message, level, duration_ms)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if getattr(self, "_toasts", None) is not None:
+            self._toasts.reposition()
 
     def closeEvent(self, event) -> None:
         """Handles application shutdown cleanly according to TDD v1.9."""
