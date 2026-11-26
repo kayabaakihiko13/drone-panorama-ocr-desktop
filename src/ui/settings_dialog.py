@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Signal, Qt
 from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
@@ -33,13 +33,62 @@ from src.recognition.detector import describe_compute_plan, run_gpu_preflight_pr
 from src.utils.security import retrieve_auth_token, store_auth_token
 
 
+class _ProbeSignals(QObject):
+    ready = Signal(str, str)  # (hw_text, compute_preview_html)
+
+
+class _ProbeWorker(QRunnable):
+    """Runs torch/CUDA/ONNX hardware probing off the UI thread."""
+
+    def __init__(self, requested_device: str, signals: _ProbeSignals):
+        super().__init__()
+        self.requested_device = requested_device
+        self.signals = signals
+
+    def run(self) -> None:
+        try:
+            hw_text = SettingsDialog._detect_hardware_summary()
+        except Exception as e:
+            hw_text = f"Status Hardware: gagal dideteksi ({e})"
+        try:
+            plan = describe_compute_plan(self.requested_device)
+            preview_html = SettingsDialog._format_compute_preview(plan)
+        except Exception as e:
+            preview_html = f"<i>Gagal menghitung compute plan: {e}</i>"
+        self.signals.ready.emit(hw_text, preview_html)
+
+
 class SettingsDialog(QDialog):
     def __init__(self, config: AppConfig, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.config = config
+        self._probe_ready = False
+        self._probe_started = False
+        self._probe_signals = _ProbeSignals(self)
+        self._probe_signals.ready.connect(self._on_probe_ready)
+
         self.setWindowTitle("Pengaturan Aplikasi & OCR")
         self.resize(550, 520)
         self._init_ui()
+
+        # Start the probe AFTER the dialog paints — UI feels instant.
+        QTimer.singleShot(0, self._start_hw_probe)
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        # Safety net in case QTimer.singleShot(0) hasn't fired yet
+        if not self._probe_started:
+            self._probe_started = True
+            self._start_hw_probe()
+
+    def _start_hw_probe(self) -> None:
+        if self._probe_started and self._probe_ready:
+            return
+        self._probe_started = True
+        dev = str(self.device_combo.currentData() or "auto")
+        QThreadPool.globalInstance().start(_ProbeWorker(dev, self._probe_signals))
+
+    # ------------------------------------------------------------------ UI
 
     def _init_ui(self) -> None:
         layout = QVBoxLayout(self)
@@ -55,7 +104,6 @@ class SettingsDialog(QDialog):
         self.gate_edit.setToolTip("Wajib string angka, misalnya '1' (non-angka memicu error backend 500)")
         api_form.addRow("Gate ID (Angka):", self.gate_edit)
 
-        # Token input (retrieved from Windows DPAPI)
         current_token = retrieve_auth_token() or ""
         self.token_edit = QLineEdit(current_token)
         self.token_edit.setEchoMode(QLineEdit.EchoMode.Password)
@@ -80,7 +128,6 @@ class SettingsDialog(QDialog):
         test_row.addWidget(self.btn_test_conn)
         api_form.addRow("", test_row)
 
-        # Quick Login Section
         self.user_edit = QLineEdit()
         self.user_edit.setPlaceholderText("Username / Email akun OCR")
         api_form.addRow("Login Akun:", self.user_edit)
@@ -120,15 +167,15 @@ class SettingsDialog(QDialog):
         curr_dev = str(getattr(self.config.stitching, "device", "auto") or "auto").lower()
         dev_idx = self.device_combo.findData(curr_dev)
         self.device_combo.setCurrentIndex(dev_idx if dev_idx >= 0 else 0)
-        self.device_combo.currentIndexChanged.connect(self._update_compute_preview)
+        self.device_combo.currentIndexChanged.connect(self._on_device_changed)
         det_form.addRow("Perangkat Komputasi:", self.device_combo)
 
-        hw_text = self._detect_hardware_summary()
+        # Hardware status: placeholder first, filled by worker
         hw_row = QHBoxLayout()
-        lbl_hw = QLabel(hw_text)
-        lbl_hw.setStyleSheet("color: #aaa; font-size: 11px;")
-        lbl_hw.setWordWrap(True)
-        hw_row.addWidget(lbl_hw, 1)
+        self.lbl_hw = QLabel("Mendeteksi hardware…")
+        self.lbl_hw.setStyleSheet("color: #aaa; font-size: 11px;")
+        self.lbl_hw.setWordWrap(True)
+        hw_row.addWidget(self.lbl_hw, 1)
 
         self.btn_test_gpu = QPushButton("Cek && Uji GPU")
         self.btn_test_gpu.setToolTip("Jalankan uji inferensi ONNX & cek CUDA/DirectML sebelum memproses video")
@@ -136,11 +183,12 @@ class SettingsDialog(QDialog):
         hw_row.addWidget(self.btn_test_gpu)
         det_form.addRow("Status Hardware:", hw_row)
 
-        self.lbl_compute_preview = QLabel("")
+        self.lbl_compute_preview = QLabel("Menghitung compute plan…")
         self.lbl_compute_preview.setWordWrap(True)
-        self.lbl_compute_preview.setStyleSheet("font-size: 11px; padding: 4px; background: #1e1e1e; border-radius: 4px;")
+        self.lbl_compute_preview.setStyleSheet(
+            "font-size: 11px; padding: 4px; background: #1e1e1e; border-radius: 4px;"
+        )
         det_form.addRow("Aktif Sebelum Run:", self.lbl_compute_preview)
-        self._update_compute_preview()
 
         self.thresh_container = QDoubleSpinBox()
         self.thresh_container.setRange(0.05, 0.99)
@@ -205,6 +253,8 @@ class SettingsDialog(QDialog):
         button_box.rejected.connect(self.reject)
         layout.addWidget(button_box)
 
+    # ----------------------------------------------------- Hardware probe
+
     @staticmethod
     def _detect_hardware_summary() -> str:
         cuda_info = "CUDA: Tidak tersedia"
@@ -228,21 +278,49 @@ class SettingsDialog(QDialog):
             pass
         return f"{cuda_info}{dml_note} | ONNX: [{ort_info}]"
 
-    def _update_compute_preview(self) -> None:
-        sel_dev = str(self.device_combo.currentData() or "auto")
-        plan = describe_compute_plan(sel_dev)
+    @staticmethod
+    def _format_compute_preview(plan: dict) -> str:
         track_is_gpu = plan["track_provider"] != "CPUExecutionProvider"
         color = "#4ec9b0" if track_is_gpu else "#dcdcaa"
         lines = [
             f"• <b>Tracking Frame (Tahap 1) &amp; Deteksi 4K/FRONT_REAR:</b> {plan['track_provider']}",
             f"• <b>Stitching (ALIKED/LightGlue):</b> {plan['stitch_device']}",
         ]
-        if plan["hint"]:
+        if plan.get("hint"):
             lines.append(f"• <i>{plan['hint']}</i>")
-        self.lbl_compute_preview.setStyleSheet(
-            f"color: {color}; font-size: 11px; padding: 5px; background: #1e1e1e; border-radius: 4px;"
+        return (
+            f'<span style="color: {color}; font-size: 11px;">'
+            + "<br>".join(lines)
+            + "</span>"
         )
-        self.lbl_compute_preview.setText("<br>".join(lines))
+
+    def _on_probe_ready(self, hw_text: str, preview_html: str) -> None:
+        self._probe_ready = True
+        self.lbl_hw.setText(hw_text)
+        # If user already changed the device while probe was running,
+        # recompute the preview (fast path — describe_compute_plan is cached).
+        try:
+            sel_dev = str(self.device_combo.currentData() or "auto")
+            plan = describe_compute_plan(sel_dev)
+            self.lbl_compute_preview.setText(self._format_compute_preview(plan))
+        except Exception:
+            self.lbl_compute_preview.setText(preview_html)
+
+    def _on_device_changed(self, *_args) -> None:
+        if not self._probe_ready:
+            return  # wait until probe done to avoid touching torch in UI thread
+        try:
+            sel_dev = str(self.device_combo.currentData() or "auto")
+            plan = describe_compute_plan(sel_dev)
+            self.lbl_compute_preview.setText(self._format_compute_preview(plan))
+        except Exception as e:
+            self.lbl_compute_preview.setText(f"<i>Gagal menghitung compute plan: {e}</i>")
+
+    # Backwards-compatible alias, in case other code calls it
+    def _update_compute_preview(self) -> None:
+        self._on_device_changed()
+
+    # --------------------------------------------------------- GPU probe
 
     def _on_test_gpu_clicked(self) -> None:
         from PySide6.QtWidgets import QApplication
@@ -274,6 +352,8 @@ class SettingsDialog(QDialog):
         if res.get("hint"):
             msg += f"\nCatatan:\n{res['hint']}"
         QMessageBox.information(self, "Hasil Cek & Uji Perangkat GPU", msg)
+
+    # ------------------------------------------------------------ Login
 
     def _do_login(self) -> None:
         url = self.api_url_edit.text().strip()
@@ -307,8 +387,7 @@ class SettingsDialog(QDialog):
 
         if not token:
             QMessageBox.warning(
-                self,
-                "Token Kosong",
+                self, "Token Kosong",
                 "Kolom Auth Token masih kosong.\nSilakan paste token yang valid atau login dengan username & password di bawah.",
             )
             return
@@ -321,14 +400,12 @@ class SettingsDialog(QDialog):
             if new_token:
                 self.token_edit.setText(new_token)
                 QMessageBox.information(
-                    self,
-                    "Sukses",
+                    self, "Sukses",
                     "Koneksi ke Halotec OCR Service berhasil!\nToken aktif dan berhasil di-refresh.",
                 )
             else:
                 QMessageBox.warning(
-                    self,
-                    "Token Tidak Valid / Kedaluwarsa",
+                    self, "Token Tidak Valid / Kedaluwarsa",
                     "Server OCR dapat dihubungi, namun token tidak valid atau sudah kedaluwarsa.\nSilakan masukkan token baru atau login ulang.",
                 )
         except Exception as e:
@@ -353,7 +430,6 @@ class SettingsDialog(QDialog):
         self.config.video_resolution = self.video_res_combo.currentData() or "720P"
         self.config.paths.output_dir = self.out_dir_edit.text().strip()
 
-        # Validasi ketat token jika diubah
         curr_saved_token = retrieve_auth_token() or ""
         clean_token = token.strip()
         if clean_token.lower().startswith("bearer "):
@@ -365,8 +441,7 @@ class SettingsDialog(QDialog):
             is_valid, msg, validated_token = client.validate_token(clean_token)
             if not is_valid:
                 QMessageBox.warning(
-                    self,
-                    "Token Tidak Valid",
+                    self, "Token Tidak Valid",
                     f"Pengaturan tidak dapat disimpan karena token ditolak oleh server:\n\n{msg}\n\nSilakan periksa kembali atau login dengan akun Anda.",
                 )
                 return

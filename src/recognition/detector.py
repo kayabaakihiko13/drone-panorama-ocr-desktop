@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import sys
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, NamedTuple, Optional, Tuple
 
@@ -77,12 +78,10 @@ def letterbox(
     if isinstance(new_shape, int):
         new_shape = (new_shape, new_shape)
 
-    # Scale ratio (new / old)
     r = min(new_shape[0] / shape[0], new_shape[1] / shape[1])
     if not scaleup:
         r = min(r, 1.0)
 
-    # Compute padding
     ratio = r, r
     new_unpad = int(round(shape[1] * r)), int(round(shape[0] * r))
     dw, dh = new_shape[1] - new_unpad[0], new_shape[0] - new_unpad[1]
@@ -230,7 +229,6 @@ class OnnxDetector:
         self.input_name = self.session.get_inputs()[0].name
         self.output_name = self.session.get_outputs()[0].name
 
-        # Detect static spatial input dimensions if fixed by ONNX export
         inp_shape = self.session.get_inputs()[0].shape
         self.model_imgsz: Optional[Tuple[int, int]] = None
         if len(inp_shape) >= 4 and isinstance(inp_shape[2], int) and isinstance(inp_shape[3], int):
@@ -254,26 +252,22 @@ class OnnxDetector:
 
         orig_h, orig_w = img.shape[:2]
 
-        # Preprocessing: letterbox resize (use model's static shape if fixed, else requested imgsz)
         target_shape = self.model_imgsz if self.model_imgsz is not None else (imgsz, imgsz)
         padded_img, ratio, (dw, dh) = letterbox(img, new_shape=target_shape, auto=False)
         blob = cv2.cvtColor(padded_img, cv2.COLOR_BGR2RGB)
         blob = blob.astype(np.float32) / 255.0
-        blob = np.transpose(blob, (2, 0, 1))  # HWC to CHW
-        blob = np.expand_dims(blob, axis=0)  # BCHW
+        blob = np.transpose(blob, (2, 0, 1))
+        blob = np.expand_dims(blob, axis=0)
 
-        # Inference
         outputs = self.session.run([self.output_name], {self.input_name: blob})[0]
-        # output shape is [1, 9, anchors] -> (batch, 4_box + 5_classes, num_anchors)
-        preds = np.squeeze(outputs, axis=0).T  # [num_anchors, 9]
+        preds = np.squeeze(outputs, axis=0).T
 
-        boxes = preds[:, :4]  # cx, cy, w, h
-        class_scores = preds[:, 4:]  # 5 classes
+        boxes = preds[:, :4]
+        class_scores = preds[:, 4:]
 
         class_ids = np.argmax(class_scores, axis=1)
         confidences = np.max(class_scores, axis=1)
 
-        # Filter by confidence threshold
         mask = confidences >= conf_thresh
         if classes is not None:
             class_mask = np.isin(class_ids, classes)
@@ -286,20 +280,17 @@ class OnnxDetector:
         if len(boxes) == 0:
             return []
 
-        # Convert xywh to xyxy on padded image
         cx, cy, w, h = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
         x1 = cx - w / 2
         y1 = cy - h / 2
         x2 = cx + w / 2
         y2 = cy + h / 2
 
-        # Scale coordinates back to original image
         x1 = (x1 - dw) / ratio
         y1 = (y1 - dh) / ratio
         x2 = (x2 - dw) / ratio
         y2 = (y2 - dh) / ratio
 
-        # Clip coordinates
         x1 = np.clip(np.round(x1), 0, orig_w).astype(int)
         y1 = np.clip(np.round(y1), 0, orig_h).astype(int)
         x2 = np.clip(np.round(x2), 0, orig_w).astype(int)
@@ -307,7 +298,6 @@ class OnnxDetector:
 
         scaled_boxes = np.stack([x1, y1, x2, y2], axis=1)
 
-        # Per-class NMS
         final_boxes: List[DetectionBox] = []
         unique_classes = np.unique(class_ids)
 
@@ -348,7 +338,14 @@ class OnnxDetector:
         return image[y:y2, x:x2]
 
 
-def describe_compute_plan(device: str = "auto") -> Dict[str, Any]:
+# ---------------------------------------------------------------------------
+# Compute plan: cached, since torch/CUDA/ONNX provider probing is expensive
+# (cold start 1–3 s). Hardware doesn't change during an app run, so caching
+# per requested device is safe. Callers get a fresh dict copy so mutation
+# (e.g. run_gpu_preflight_probe) cannot corrupt the cache.
+# ---------------------------------------------------------------------------
+
+def describe_compute_plan_impl(device: str = "auto") -> Dict[str, Any]:
     """
     Summarize exact runtime compute device per pipeline stage without loading models.
     Reused by SettingsDialog preview and pre-run MainWindow confirmation.
@@ -416,10 +413,34 @@ def describe_compute_plan(device: str = "auto") -> Dict[str, Any]:
     }
 
 
+@lru_cache(maxsize=8)
+def _describe_compute_plan_cached(device_key: str) -> Dict[str, Any]:
+    return describe_compute_plan_impl(device_key)
+
+
+def describe_compute_plan(device: str = "auto") -> Dict[str, Any]:
+    """
+    Cached wrapper around describe_compute_plan_impl.
+
+    Returns a shallow copy so callers can freely mutate the result
+    (e.g. run_gpu_preflight_probe adds 'probe_ok', 'active_provider', ...)
+    without polluting the cache. Values inside are primitives or lists that
+    callers do not modify.
+    """
+    key = str(device or "cpu").strip().lower()
+    return dict(_describe_compute_plan_cached(key))
+
+
+def clear_compute_plan_cache() -> None:
+    """Clear cache — useful if hardware state changes (rare) or in unit tests."""
+    _describe_compute_plan_cached.cache_clear()
+
+
 def run_gpu_preflight_probe(model_path: Path | str, device: str = "auto") -> Dict[str, Any]:
     """Run a quick live 480x480 warmup + timed inference check for the requested compute device."""
     import time
 
+    # Copy — do not mutate the cached plan dict.
     plan = describe_compute_plan(device)
     m_path = Path(model_path)
     if not m_path.is_file():
