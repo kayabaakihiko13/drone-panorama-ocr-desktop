@@ -299,14 +299,15 @@ class MainWindow(QMainWindow):
         self.event_timer.setInterval(100)
         self.event_timer.timeout.connect(self._process_orchestrator_events)
         self.event_timer.start()
-    def _scroll_activity_log_to_bottom(self)-> None:
+
+    def _scroll_activity_log_to_bottom(self) -> None:
         scroll_bar = self.txt_activity_log.verticalScrollBar()
         scroll_bar.setValue(scroll_bar.maximum())
-    def _append_activity_log(self,message:str)->None:
+
+    def _append_activity_log(self, message: str) -> None:
         self.txt_activity_log.appendPlainText(message)
-        # Tunggu Qt memperbarui tinggi dokumen dan nilai maksimum scrollbar.
-        QTimer.singleShot(0,self._scroll_activity_log_to_bottom)
-    
+        QTimer.singleShot(0, self._scroll_activity_log_to_bottom)
+
     def _process_orchestrator_events(self) -> None:
         while not self.evt_queue.empty():
             try:
@@ -464,7 +465,11 @@ class MainWindow(QMainWindow):
         # Pre-run hardware confirmation so user sees active GPU/CPU per stage before running
         while True:
             req_dev = str(getattr(self.config.stitching, "device", "auto") or "auto")
-            plan = describe_compute_plan(req_dev)
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                plan = describe_compute_plan(req_dev)
+            finally:
+                QApplication.restoreOverrideCursor()
             summary_lines = [
                 f"Video: {Path(self.selected_video_path).name} | Mode: {mode} (Sensor: {camera_position})",
                 f"Pengaturan Komputasi: {req_dev.upper()}",
@@ -592,7 +597,6 @@ class MainWindow(QMainWindow):
             status_item.setForeground(QColor("#107C41" if c["status"] == "stable" else "#FF8C00"))
             self.container_table.setItem(row, 2, status_item)
 
-            # Container number detection
             c_num_det = c.get("detections", {}).get("container_number")
             iso_det = c.get("detections", {}).get("iso_code")
 
@@ -627,7 +631,6 @@ class MainWindow(QMainWindow):
                 rev_item.setForeground(QColor("#0078D4"))
             self.container_table.setItem(row, 7, rev_item)
 
-            # Store container and detection ids
             self.container_table.item(row, 0).setData(Qt.ItemDataRole.UserRole, c["id"])
             if c_num_det:
                 self.container_table.item(row, 3).setData(Qt.ItemDataRole.UserRole, c_num_det["id"])
@@ -658,14 +661,12 @@ class MainWindow(QMainWindow):
             curr_text = ""
         self.edit_manual_num.setText(curr_text)
 
-        # Load image previews
         detections = self.db.get_detections_for_container(c_id)
         containers = [c for c in self.db.get_containers_for_job(self.current_job_id or 0) if c["id"] == c_id]
         if not containers:
             return
         c_info = containers[0]
 
-        # Panorama Image
         pano_path = c_info.get("annotated_image_path") or c_info.get("image_path")
         if pano_path and Path(pano_path).is_file():
             pix = QPixmap(pano_path)
@@ -678,7 +679,6 @@ class MainWindow(QMainWindow):
         else:
             self.lbl_pano_img.setText("Citra panorama sedang diproses oleh Stitching Engine (ALIKED)...")
 
-        # Crops
         self.lbl_crop_num.setText("Crop nomor tidak tersedia")
         self.lbl_crop_iso.setText("Crop ISO code tidak tersedia")
 
@@ -900,7 +900,11 @@ class MainWindow(QMainWindow):
             QMessageBox.critical(self, "Gagal Ekspor", f"Terjadi kesalahan saat menyimpan CSV:\n{e}")
 
     def _open_settings(self) -> None:
-        dlg = SettingsDialog(self.config, self)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            dlg = SettingsDialog(self.config, self)
+        finally:
+            QApplication.restoreOverrideCursor()
         if dlg.exec():
             self.cmd_queue.put({"action": "UPDATE_CONFIG", "config": self.config.to_dict()})
             dev_lbl = str(getattr(self.config.stitching, "device", "cpu")).upper()
@@ -951,7 +955,6 @@ class MainWindow(QMainWindow):
             if self.orchestrator:
                 self.orchestrator.cancel_current_job()
 
-        # 0. Cleanly close any open video player dialog to free WMF / DirectX devices
         if hasattr(self, "_active_video_dlg") and self._active_video_dlg is not None:
             try:
                 self._active_video_dlg.close()
@@ -959,21 +962,17 @@ class MainWindow(QMainWindow):
                 pass
             self._active_video_dlg = None
 
-        # 1. Stop polling timer immediately so event loop isn't kept alive
         if hasattr(self, "event_timer") and self.event_timer.isActive():
             self.event_timer.stop()
 
-        # 2. Signal Orchestrator to stop
         if hasattr(self, "cmd_queue") and self.cmd_queue is not None:
             try:
                 self.cmd_queue.put({"action": "STOP"})
             except Exception:
                 pass
 
-        # 3. Accept close event
         event.accept()
 
-        # 4. Explicitly quit QApplication so app.exec() terminates immediately
         app_inst = QApplication.instance()
         if app_inst:
             app_inst.quit()
