@@ -366,7 +366,6 @@ class Orchestrator(threading.Thread):
         self.cmd_queue.put({"action": "STOP"})
 
     def run(self) -> None:
-        # Check and recover interrupted jobs on startup
         if self.config.auto_resume_interrupted:
             recovered = self.db.mark_interrupted_jobs()
             if recovered > 0:
@@ -385,17 +384,35 @@ class Orchestrator(threading.Thread):
                 continue
 
             action = cmd.get("action")
-            if action == "STOP":
-                break
-            elif action == "START_JOB":
-                self._handle_start_job(cmd)
-            elif action == "CANCEL_JOB":
-                self.cancel_current_job()
-            elif action == "MANUAL_OVERRIDE":
-                self._handle_manual_override(cmd)
-            elif action == "UPDATE_CONFIG":
-                self._handle_update_config(cmd)
-            self.cmd_queue.task_done()
+            try:
+                if action == "STOP":
+                    break
+                elif action == "START_JOB":
+                    self._handle_start_job(cmd)
+                elif action == "CANCEL_JOB":
+                    self.cancel_current_job()
+                elif action == "MANUAL_OVERRIDE":
+                    self._handle_manual_override(cmd)
+                elif action == "UPDATE_CONFIG":
+                    self._handle_update_config(cmd)
+            except Exception as e:
+                import traceback
+                tb = traceback.format_exc()
+                try:
+                    self._emit_event(
+                        OrchestratorEvent(
+                            type="LOG",
+                            job_id=self._current_job_id or 0,
+                            data={"log": f"[ORCHESTRATOR ERROR] action={action}: {e}\n{tb}"},
+                        )
+                    )
+                except Exception:
+                    print(f"[FATAL] Gagal emit error: {e}\n{tb}")
+            finally:
+                try:
+                    self.cmd_queue.task_done()
+                except Exception:
+                    pass
 
     def _handle_start_job(self, cmd: Dict[str, Any]) -> None:
         name = cmd.get("name", "Job")
@@ -2422,27 +2439,72 @@ class Orchestrator(threading.Thread):
 
     def _handle_manual_override(self, cmd: Dict[str, Any]) -> None:
         detection_id = cmd.get("detection_id")
-        text = cmd.get("text", "").strip()
-        if not detection_id:
+        text = cmd.get("text", "").strip().upper()
+        if not detection_id or not text:
             return
 
         iso_res = validate_iso6346(text)
-        self.db.update_detection_manual_override(
-            detection_id=detection_id,
-            manual_override_text=text,
-            is_valid_iso=iso_res.is_valid,
-        )
-        self.db.log_audit(
-            "INFO",
-            f"Manual override detection {detection_id}: '{text}' (ISO valid: {iso_res.is_valid})",
-        )
-        self._emit_event(
-            OrchestratorEvent(
-                type="MANUAL_OVERRIDE_SAVED",
-                job_id=self._current_job_id or 0,
-                data={"detection_id": detection_id, "text": text, "is_valid": iso_res.is_valid},
+
+        try:
+            # Resolve job_id yang benar untuk UI filter.
+            # Prioritas: payload dari UI → _current_job_id → DB lookup.
+            event_job_id: Optional[int] = cmd.get("job_id")
+            if event_job_id is None:
+                event_job_id = self._current_job_id
+            if event_job_id is None:
+                try:
+                    with self.db._get_connection() as conn:
+                        r = conn.execute(
+                            """
+                            SELECT c.job_id FROM detections d
+                            JOIN containers c ON c.id = d.container_id
+                            WHERE d.id = ?
+                            """,
+                            (int(detection_id),),
+                        ).fetchone()
+                    if r is not None:
+                        event_job_id = int(r["job_id"]) if hasattr(r, "keys") else int(r[0])
+                except Exception:
+                    event_job_id = None
+
+            self.db.update_detection_manual_override(
+                detection_id=int(detection_id),
+                manual_override_text=text,
+                is_valid_iso=iso_res.is_valid,
             )
-        )
+            try:
+                self.db.log_audit(
+                    "INFO",
+                    f"Manual override detection {detection_id}: '{text}' (ISO valid: {iso_res.is_valid})",
+                    job_id=event_job_id,
+                )
+            except Exception:
+                pass
+
+            self._emit_event(
+                OrchestratorEvent(
+                    type="MANUAL_OVERRIDE_SAVED",
+                    job_id=int(event_job_id or 0),
+                    data={
+                        "detection_id": int(detection_id),
+                        "text": text,
+                        "is_valid": iso_res.is_valid,
+                    },
+                )
+            )
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            try:
+                self._emit_event(
+                    OrchestratorEvent(
+                        type="LOG",
+                        job_id=self._current_job_id or 0,
+                        data={"log": f"[MANUAL OVERRIDE ERROR] det_id={detection_id}: {e}\n{tb}"},
+                    )
+                )
+            except Exception:
+                print(f"[FATAL] Manual override gagal: {e}\n{tb}")
 
     def _handle_update_config(self, cmd: Dict[str, Any]) -> None:
         new_cfg_dict = cmd.get("config", {})
