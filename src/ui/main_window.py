@@ -299,7 +299,14 @@ class MainWindow(QMainWindow):
         self.event_timer.setInterval(100)
         self.event_timer.timeout.connect(self._process_orchestrator_events)
         self.event_timer.start()
-
+    def _scroll_activity_log_to_bottom(self)-> None:
+        scroll_bar = self.txt_activity_log.verticalScrollBar()
+        scroll_bar.setValue(scroll_bar.maximum())
+    def _append_activity_log(self,message:str)->None:
+        self.txt_activity_log.appendPlainText(message)
+        # Tunggu Qt memperbarui tinggi dokumen dan nilai maksimum scrollbar.
+        QTimer.singleShot(0,self._scroll_activity_log_to_bottom)
+    
     def _process_orchestrator_events(self) -> None:
         while not self.evt_queue.empty():
             try:
@@ -317,7 +324,6 @@ class MainWindow(QMainWindow):
                 self.progress_bar.setValue(2)
                 self.txt_activity_log.setPlainText(f"[{now_str}] === MULAI JOB {evt.job_id}: {evt.data.get('name')} ===\n")
                 self.txt_activity_log.appendPlainText(f"[{now_str}] Mode: {evt.data.get('mode')}, Sensor: {evt.data.get('camera_position')}")
-                self.txt_activity_log.ensureCursorVisible()
                 self._load_jobs()
             elif evt.type == "PROGRESS":
                 pct = int(evt.data.get("progress", 0.0) * 100)
@@ -328,11 +334,9 @@ class MainWindow(QMainWindow):
                 log_entry = evt.data.get("log")
                 if log_entry:
                     self.txt_activity_log.appendPlainText(f"[{now_str}] {log_entry}")
-                    self.txt_activity_log.ensureCursorVisible()
                 elif msg:
                     if not msg.startswith("Tahap 1/4: Tracking frame") or pct % 10 == 0:
                         self.txt_activity_log.appendPlainText(f"[{now_str}] {msg}")
-                        self.txt_activity_log.ensureCursorVisible()
             elif evt.type == "CONTAINER_PROCESSED":
                 if self.current_job_id == evt.job_id:
                     self._load_containers_for_job(evt.job_id)
@@ -341,7 +345,6 @@ class MainWindow(QMainWindow):
                 self.progress_bar.setValue(100)
                 self.show_toast("Job Selesai.", "success")
                 self.txt_activity_log.appendPlainText(f"[{now_str}] [SUKSES] {evt.data.get('message', 'Job selesai!')}\n")
-                self.txt_activity_log.ensureCursorVisible()
                 self._load_jobs()
                 if self.current_job_id == evt.job_id:
                     self._load_containers_for_job(evt.job_id)
@@ -350,7 +353,6 @@ class MainWindow(QMainWindow):
                 self.progress_bar.setValue(0)
                 self.show_toast("Job Gagal.", "error")
                 self.txt_activity_log.appendPlainText(f"[{now_str}] [GAGAL] {evt.data.get('error')}\n")
-                self.txt_activity_log.ensureCursorVisible()
                 self._load_jobs()
                 QMessageBox.critical(self, "Error Job", f"Job {evt.job_id} gagal:\n{evt.data.get('error')}")
             elif evt.type == "JOB_CANCELLED":
@@ -358,7 +360,6 @@ class MainWindow(QMainWindow):
                 self.progress_bar.setValue(0)
                 self.show_toast("Proses Dibatalkan.", "warning")
                 self.txt_activity_log.appendPlainText(f"[{now_str}] [DIBATALKAN] {evt.data.get('message', 'Proses dibatalkan oleh pengguna.')}\n")
-                self.txt_activity_log.ensureCursorVisible()
                 self._load_jobs()
             elif evt.type == "MANUAL_OVERRIDE_SAVED":
                 if self.current_job_id:
@@ -369,7 +370,6 @@ class MainWindow(QMainWindow):
                     if not log_entry.startswith("["):
                         log_entry = f"[{now_str}] {log_entry}"
                     self.txt_activity_log.appendPlainText(log_entry)
-                    self.txt_activity_log.ensureCursorVisible()
 
     def _on_select_video(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
