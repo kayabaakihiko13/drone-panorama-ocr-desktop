@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import QSize, Qt, QTimer
-from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtGui import QColor, QPixmap, QTransform
 from PySide6.QtWidgets import (
     QApplication,
     QComboBox,
@@ -68,6 +68,10 @@ class MainWindow(QMainWindow):
         self.selected_container_id: Optional[int] = None
         self.selected_detection_id: Optional[int] = None
         self.is_job_running = False
+
+        # Menyimpan gambar asli untuk fitur rotasi
+        self._orig_crop_num_pixmap: Optional[QPixmap] = None
+        self._orig_crop_iso_pixmap: Optional[QPixmap] = None
 
         self.setWindowTitle("Halotec Container OCR - Drone View (Windows Desktop)")
         self.resize(1300, 850)
@@ -245,22 +249,48 @@ class MainWindow(QMainWindow):
 
         crop_tabs = QTabWidget()
 
-        # Tab Container Number Crop
+        # --- Tab Container Number Crop ---
         tab_num = QWidget()
         tab_num_lay = QVBoxLayout(tab_num)
         self.lbl_crop_num = QLabel("Crop Nomor Kontainer")
         self.lbl_crop_num.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_crop_num.setStyleSheet("background-color: #252526; color: #888;")
         tab_num_lay.addWidget(self.lbl_crop_num)
+        
+        # Tombol Rotasi untuk Nomor
+        num_rot_lay = QHBoxLayout()
+        num_rot_lay.addStretch()
+        self.btn_rot_num_ccw = QPushButton("⟲ Putar Kiri")
+        self.btn_rot_num_cw = QPushButton("⟳ Putar Kanan")
+        self.btn_rot_num_ccw.clicked.connect(lambda: self._rotate_crop("num", -90))
+        self.btn_rot_num_cw.clicked.connect(lambda: self._rotate_crop("num", 90))
+        num_rot_lay.addWidget(self.btn_rot_num_ccw)
+        num_rot_lay.addWidget(self.btn_rot_num_cw)
+        num_rot_lay.addStretch()
+        tab_num_lay.addLayout(num_rot_lay)
+        
         crop_tabs.addTab(tab_num, "Nomor Kontainer")
 
-        # Tab ISO Code Crop
+        # --- Tab ISO Code Crop ---
         tab_iso = QWidget()
         tab_iso_lay = QVBoxLayout(tab_iso)
         self.lbl_crop_iso = QLabel("Crop ISO Code")
         self.lbl_crop_iso.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_crop_iso.setStyleSheet("background-color: #252526; color: #888;")
         tab_iso_lay.addWidget(self.lbl_crop_iso)
+        
+        # Tombol Rotasi untuk ISO
+        iso_rot_lay = QHBoxLayout()
+        iso_rot_lay.addStretch()
+        self.btn_rot_iso_ccw = QPushButton("⟲ Putar Kiri")
+        self.btn_rot_iso_cw = QPushButton("⟳ Putar Kanan")
+        self.btn_rot_iso_ccw.clicked.connect(lambda: self._rotate_crop("iso", -90))
+        self.btn_rot_iso_cw.clicked.connect(lambda: self._rotate_crop("iso", 90))
+        iso_rot_lay.addWidget(self.btn_rot_iso_ccw)
+        iso_rot_lay.addWidget(self.btn_rot_iso_cw)
+        iso_rot_lay.addStretch()
+        tab_iso_lay.addLayout(iso_rot_lay)
+        
         crop_tabs.addTab(tab_iso, "ISO Code")
 
         crop_lay.addWidget(crop_tabs)
@@ -363,7 +393,10 @@ class MainWindow(QMainWindow):
                 self.txt_activity_log.appendPlainText(f"[{now_str}] [DIBATALKAN] {evt.data.get('message', 'Proses dibatalkan oleh pengguna.')}\n")
                 self._load_jobs()
             elif evt.type == "MANUAL_OVERRIDE_SAVED":
-                if self.current_job_id:
+                self.btn_save_override.setText("Simpan Koreksi")
+                self.btn_save_override.setEnabled(True)
+                self.show_toast(f"Koreksi tersimpan untuk detection #{evt.data.get('detection_id', '?')}", "success")
+                if evt.job_id == self.current_job_id:
                     self._load_containers_for_job(self.current_job_id)
             elif evt.type == "LOG":
                 log_entry = evt.data.get("log") or evt.data.get("message")
@@ -444,6 +477,10 @@ class MainWindow(QMainWindow):
         self.lbl_crop_num.setPixmap(QPixmap())
         self.lbl_crop_iso.setText("Menunggu deteksi...")
         self.lbl_crop_iso.setPixmap(QPixmap())
+        
+        self._orig_crop_num_pixmap = None
+        self._orig_crop_iso_pixmap = None
+
         self.edit_manual_num.clear()
         self.lbl_iso_feedback.setText("-")
         self.btn_save_override.setEnabled(False)
@@ -606,16 +643,34 @@ class MainWindow(QMainWindow):
             conf_val = 0.0
 
             if c_num_det:
-                num_text = c_num_det.get("manual_override_text") or c_num_det.get("ocr_clean_text") or c_num_det.get("ocr_raw_text") or "-"
+                is_manual = bool(c_num_det.get("is_reviewed"))
+                
+                # Tampilkan teks manual jika ada, jika tidak pakai hasil OCR
+                if is_manual and c_num_det.get("manual_override_text"):
+                    num_text = c_num_det.get("manual_override_text")
+                else:
+                    num_text = c_num_det.get("ocr_clean_text") or c_num_det.get("ocr_raw_text") or "-"
+                    
                 conf_val = c_num_det.get("confidence", 0.0)
+                
                 if c_num_det.get("is_valid_iso"):
-                    iso_badge = "VALID (ISO 6346)"
-                    badge_color = "#107C41"
+                    if is_manual:
+                        iso_badge = "VALID (Manual Fix)"
+                        badge_color = "#0078D4"  # Biru (koreksi user)
+                    else:
+                        iso_badge = "VALID (Auto OCR)"
+                        badge_color = "#107C41"  # Hijau (sistem otomatis)
                 else:
                     iso_badge = "CHECK DIGIT / FORMAT ERROR"
                     badge_color = "#D83B01"
 
-            self.container_table.setItem(row, 3, QTableWidgetItem(num_text))
+            # Beri warna biru/cyan pada teks nomor jika ini hasil koreksi manual
+            num_item = QTableWidgetItem(num_text)
+            if c_num_det and c_num_det.get("is_reviewed"):
+                num_item.setForeground(QColor("#4fc1ff")) 
+                orig_text = c_num_det.get("ocr_clean_text") or c_num_det.get("ocr_raw_text") or "-"
+                num_item.setToolTip(f"Manual Override. Sistem membaca: '{orig_text}'")
+            self.container_table.setItem(row, 3, num_item)
 
             badge_item = QTableWidgetItem(iso_badge)
             badge_item.setForeground(QColor(badge_color))
@@ -656,12 +711,23 @@ class MainWindow(QMainWindow):
 
         c_num_item = self.container_table.item(row, 3)
         self.selected_detection_id = c_num_item.data(Qt.ItemDataRole.UserRole) if c_num_item else None
+        # Aktifkan tombol simpan koreksi hanya jika kontainer ini punya data nomor
+        self.btn_save_override.setEnabled(bool(self.selected_detection_id))
+        
         curr_text = c_num_item.text() if c_num_item else ""
         if curr_text == "-":
             curr_text = ""
         self.edit_manual_num.setText(curr_text)
 
         detections = self.db.get_detections_for_container(c_id)
+        c_num_det = next((d for d in detections if d["detection_type"] == "container_number"), None)
+
+        # Tampilkan info perbandingan OCR vs Manual di bar bawah
+        if c_num_det and c_num_det.get("is_reviewed"):
+            orig_text = c_num_det.get("ocr_clean_text") or c_num_det.get("ocr_raw_text") or "-"
+            self.lbl_iso_feedback.setText(f" [Dikoreksi] Sistem membaca: '{orig_text}'")
+            self.lbl_iso_feedback.setStyleSheet("color: #0078D4; font-weight: bold;")
+        
         containers = [c for c in self.db.get_containers_for_job(self.current_job_id or 0) if c["id"] == c_id]
         if not containers:
             return
@@ -679,22 +745,50 @@ class MainWindow(QMainWindow):
         else:
             self.lbl_pano_img.setText("Citra panorama sedang diproses oleh Stitching Engine (ALIKED)...")
 
+        # Reset gambar & pixmap asli sebelum memuat yang baru
         self.lbl_crop_num.setText("Crop nomor tidak tersedia")
+        self.lbl_crop_num.setPixmap(QPixmap())
         self.lbl_crop_iso.setText("Crop ISO code tidak tersedia")
+        self.lbl_crop_iso.setPixmap(QPixmap())
+        self._orig_crop_num_pixmap = None
+        self._orig_crop_iso_pixmap = None
 
         for d in detections:
             crop_p = d.get("crop_image_path")
             if crop_p and Path(crop_p).is_file():
                 pix = QPixmap(crop_p)
-                scaled = pix.scaled(
-                    QSize(300, 120),
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
                 if d["detection_type"] == "container_number":
-                    self.lbl_crop_num.setPixmap(scaled)
+                    self._orig_crop_num_pixmap = pix
+                    self._render_crop_image("num")
                 elif d["detection_type"] == "iso_code":
-                    self.lbl_crop_iso.setPixmap(scaled)
+                    self._orig_crop_iso_pixmap = pix
+                    self._render_crop_image("iso")
+
+    def _render_crop_image(self, target: str):
+        """Merender gambar crop ke label dengan scaling yang tepat."""
+        pixmap = self._orig_crop_num_pixmap if target == "num" else self._orig_crop_iso_pixmap
+        label = self.lbl_crop_num if target == "num" else self.lbl_crop_iso
+
+        if pixmap and not pixmap.isNull():
+            scaled = pixmap.scaled(
+                QSize(300, 120),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+            label.setPixmap(scaled)
+        else:
+            label.setText("Crop tidak tersedia")
+
+    def _rotate_crop(self, target: str, angle: int):
+        """Memutar gambar crop sesuai sudut yang diminta (kiri/kanan)."""
+        if target == "num" and self._orig_crop_num_pixmap:
+            transform = QTransform().rotate(angle)
+            self._orig_crop_num_pixmap = self._orig_crop_num_pixmap.transformed(transform)
+            self._render_crop_image("num")
+        elif target == "iso" and self._orig_crop_iso_pixmap:
+            transform = QTransform().rotate(angle)
+            self._orig_crop_iso_pixmap = self._orig_crop_iso_pixmap.transformed(transform)
+            self._render_crop_image("iso")
 
     def _on_manual_text_changed(self, text: str) -> None:
         res = validate_iso6346(text)
@@ -719,12 +813,15 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Peringatan", "Nomor kontainer tidak boleh kosong!")
             return
 
+        self.btn_save_override.setEnabled(False)
+        self.btn_save_override.setText("Menyimpan...")
+
         self.cmd_queue.put({
             "action": "MANUAL_OVERRIDE",
             "detection_id": self.selected_detection_id,
             "text": text,
+            "job_id": self.current_job_id, # Agar orchestrator tahu job id-nya
         })
-        self.show_toast(f"Koreksi disimpan: {text}", "success")
 
     def _on_play_input_video(self) -> None:
         if not self.selected_video_path or not Path(self.selected_video_path).is_file():
@@ -881,7 +978,12 @@ class MainWindow(QMainWindow):
                     c_num = c.get("detections", {}).get("container_number", {})
                     iso_d = c.get("detections", {}).get("iso_code", {})
                     num_text = c_num.get("manual_override_text") or c_num.get("ocr_clean_text") or "-"
-                    iso_check = "VALID" if c_num.get("is_valid_iso") else "INVALID"
+                    
+                    if c_num.get("is_valid_iso"):
+                        iso_check = "VALID (Manual)" if c_num.get("is_reviewed") else "VALID (Auto)"
+                    else:
+                        iso_check = "INVALID"
+                        
                     iso_code = iso_d.get("ocr_clean_text") or "-"
                     conf = f"{c_num.get('confidence', 0.0):.2f}"
                     rev = "YES" if c_num.get("is_reviewed") else "NO"
