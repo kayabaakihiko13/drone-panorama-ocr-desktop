@@ -4,6 +4,7 @@ Main Application Window (PySide6).
 from __future__ import annotations
 
 import queue
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -59,6 +60,7 @@ class MainWindow(QMainWindow):
         self._toasts = ToastManager(self.centralWidget())
         self._init_event_timer()
         self._load_jobs()
+        self._warmup_hardware_probe_async()
 
     def _init_ui(self) -> None:
         central_widget = QWidget(self)
@@ -337,6 +339,18 @@ class MainWindow(QMainWindow):
         self.event_timer.setInterval(100)
         self.event_timer.timeout.connect(self._process_orchestrator_events)
         self.event_timer.start()
+
+    def _warmup_hardware_probe_async(self) -> None:
+        """Pre-import torch & probe CUDA di background agar buka Settings pertama instan."""
+        def _run() -> None:
+            try:
+                from src.recognition.detector import get_hardware_summary
+                get_hardware_summary()
+            except Exception as exc:  # noqa: BLE001
+                # Jangan crash app kalau torch rusak — cukup catat ke stderr
+                print(f"[hw-warmup] gagal: {exc}")
+
+        threading.Thread(target=_run, daemon=True, name="hw-warmup").start()
 
     def _scroll_activity_log_to_bottom(self) -> None:
         scroll_bar = self.txt_activity_log.verticalScrollBar()
