@@ -11,6 +11,7 @@ from typing import Optional
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, QTimer, Signal, Qt
 from PySide6.QtWidgets import (
+    QApplication,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -29,12 +30,21 @@ from PySide6.QtWidgets import (
 
 from src.config import AppConfig
 from src.ocr_client.client import HalotecOcrClient
-from src.recognition.detector import describe_compute_plan, run_gpu_preflight_probe
+from src.recognition.detector import (
+    describe_compute_plan,
+    get_hardware_summary,
+    run_gpu_preflight_probe,
+)
 from src.utils.security import retrieve_auth_token, store_auth_token
 
 
+# ---------------------------------------------------------------------------
+# Background workers
+# ---------------------------------------------------------------------------
+
 class _ProbeSignals(QObject):
-    ready = Signal(str, str)  # (hw_text, compute_preview_html)
+    ready = Signal(str, str)     # (hw_text, compute_preview_html)
+    progress = Signal(str)        # status text — Solusi 4
 
 
 class _ProbeWorker(QRunnable):
@@ -47,25 +57,60 @@ class _ProbeWorker(QRunnable):
 
     def run(self) -> None:
         try:
+            self.signals.progress.emit("Memuat PyTorch & cek CUDA…")
             hw_text = SettingsDialog._detect_hardware_summary()
-        except Exception as e:
-            hw_text = f"Status Hardware: gagal dideteksi ({e})"
-        try:
+            self.signals.progress.emit("Menyusun compute plan…")
             plan = describe_compute_plan(self.requested_device)
             preview_html = SettingsDialog._format_compute_preview(plan)
         except Exception as e:
+            hw_text = f"Status Hardware: gagal dideteksi ({e})"
             preview_html = f"<i>Gagal menghitung compute plan: {e}</i>"
         self.signals.ready.emit(hw_text, preview_html)
 
+
+class _PreflightSignals(QObject):           # ← typo "Prefilght" diperbaiki
+    ready = Signal(dict)
+    error = Signal(str)
+
+
+class _PreflightWorker(QRunnable):
+    """Menjalankan run_gpu_preflight_probe() di background agar UI tidak freeze."""
+
+    def __init__(self, model_path, device: str, signals: _PreflightSignals):
+        super().__init__()
+        self.model_path = model_path
+        self.device = device
+        self.signals = signals
+
+    def run(self) -> None:
+        try:
+            res = run_gpu_preflight_probe(self.model_path, self.device)
+            self.signals.ready.emit(res)
+        except Exception as exc:  # noqa: BLE001
+            self.signals.error.emit(str(exc))
+
+
+# ---------------------------------------------------------------------------
+# Dialog
+# ---------------------------------------------------------------------------
 
 class SettingsDialog(QDialog):
     def __init__(self, config: AppConfig, parent: Optional[QWidget] = None):
         super().__init__(parent)
         self.config = config
+
+        # --- Probe hardware (Solusi 2 + 4) ---
         self._probe_ready = False
         self._probe_started = False
         self._probe_signals = _ProbeSignals(self)
         self._probe_signals.ready.connect(self._on_probe_ready)
+        self._probe_signals.progress.connect(self._on_probe_progress)
+
+        # --- Preflight GPU test (Solusi 1) — INI YANG HILANG DI KODE ANDA ---
+        self._preflight_running = False
+        self._preflight_signals = _PreflightSignals(self)
+        self._preflight_signals.ready.connect(self._on_preflight_ready)
+        self._preflight_signals.error.connect(self._on_preflight_error)
 
         self.setWindowTitle("Pengaturan Aplikasi & OCR")
         self.resize(550, 520)
@@ -76,13 +121,12 @@ class SettingsDialog(QDialog):
 
     def showEvent(self, event) -> None:
         super().showEvent(event)
-        # Safety net in case QTimer.singleShot(0) hasn't fired yet
         if not self._probe_started:
-            self._probe_started = True
             self._start_hw_probe()
 
     def _start_hw_probe(self) -> None:
-        if self._probe_started and self._probe_ready:
+        # FIX BUG #4: guard hanya pakai _probe_started, bukan AND _probe_ready.
+        if self._probe_started:
             return
         self._probe_started = True
         dev = str(self.device_combo.currentData() or "auto")
@@ -170,7 +214,6 @@ class SettingsDialog(QDialog):
         self.device_combo.currentIndexChanged.connect(self._on_device_changed)
         det_form.addRow("Perangkat Komputasi:", self.device_combo)
 
-        # Hardware status: placeholder first, filled by worker
         hw_row = QHBoxLayout()
         self.lbl_hw = QLabel("Mendeteksi hardware…")
         self.lbl_hw.setStyleSheet("color: #aaa; font-size: 11px;")
@@ -217,7 +260,7 @@ class SettingsDialog(QDialog):
 
         layout.addWidget(det_group)
 
-        # 3. Video Output & Resolution Settings
+        # 3. Video Output Settings
         video_group = QGroupBox("Pengaturan Output Video Hasil Anotasi")
         video_form = QFormLayout(video_group)
 
@@ -228,10 +271,7 @@ class SettingsDialog(QDialog):
 
         curr_res = getattr(self.config, "video_resolution", "720P").upper()
         idx = self.video_res_combo.findData(curr_res)
-        if idx >= 0:
-            self.video_res_combo.setCurrentIndex(idx)
-        else:
-            self.video_res_combo.setCurrentIndex(0)
+        self.video_res_combo.setCurrentIndex(idx if idx >= 0 else 0)
 
         video_form.addRow("Resolusi Video:", self.video_res_combo)
         layout.addWidget(video_group)
@@ -257,25 +297,13 @@ class SettingsDialog(QDialog):
 
     @staticmethod
     def _detect_hardware_summary() -> str:
-        cuda_info = "CUDA: Tidak tersedia"
-        try:
-            import torch
-            if torch.cuda.is_available():
-                cuda_info = f"CUDA: Tersedia ({torch.cuda.get_device_name(0)})"
-            else:
-                cuda_info = f"CUDA: Tidak tersedia (torch {torch.__version__})"
-        except Exception:
-            pass
-        ort_info = "CPUExecutionProvider"
-        dml_note = ""
-        try:
-            import onnxruntime as ort
-            provs = ort.get_available_providers()
-            ort_info = ", ".join(provs)
-            if "DmlExecutionProvider" in provs:
-                dml_note = " | DirectML GPU: Aktif"
-        except Exception:
-            pass
+        hw = get_hardware_summary()   # cache hit setelah probe pertama
+        if hw["cuda_available"]:
+            cuda_info = f"CUDA: Tersedia ({hw['cuda_name']})"
+        else:
+            cuda_info = f"CUDA: Tidak tersedia (torch {hw['torch_version']})"
+        dml_note = " | DirectML GPU: Aktif" if hw["has_dml"] else ""
+        ort_info = ", ".join(hw["available_providers"])
         return f"{cuda_info}{dml_note} | ONNX: [{ort_info}]"
 
     @staticmethod
@@ -294,11 +322,13 @@ class SettingsDialog(QDialog):
             + "</span>"
         )
 
+    def _on_probe_progress(self, text: str) -> None:
+        if not self._probe_ready:
+            self.lbl_hw.setText(f"⏳ {text}")
+
     def _on_probe_ready(self, hw_text: str, preview_html: str) -> None:
         self._probe_ready = True
         self.lbl_hw.setText(hw_text)
-        # If user already changed the device while probe was running,
-        # recompute the preview (fast path — describe_compute_plan is cached).
         try:
             sel_dev = str(self.device_combo.currentData() or "auto")
             plan = describe_compute_plan(sel_dev)
@@ -308,7 +338,7 @@ class SettingsDialog(QDialog):
 
     def _on_device_changed(self, *_args) -> None:
         if not self._probe_ready:
-            return  # wait until probe done to avoid touching torch in UI thread
+            return  # tunggu probe selesai agar tidak menyentuh torch di UI thread
         try:
             sel_dev = str(self.device_combo.currentData() or "auto")
             plan = describe_compute_plan(sel_dev)
@@ -316,35 +346,58 @@ class SettingsDialog(QDialog):
         except Exception as e:
             self.lbl_compute_preview.setText(f"<i>Gagal menghitung compute plan: {e}</i>")
 
-    # Backwards-compatible alias, in case other code calls it
     def _update_compute_preview(self) -> None:
         self._on_device_changed()
 
     # --------------------------------------------------------- GPU probe
 
     def _on_test_gpu_clicked(self) -> None:
-        from PySide6.QtWidgets import QApplication
+        if self._preflight_running:
+            return  # cegah double-klik
+
         sel_dev = str(self.device_combo.currentData() or "auto")
         model_p = self.config.detection.resolved_model_path()
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+
+        self._preflight_running = True
+        self.btn_test_gpu.setEnabled(False)
+        self.btn_test_gpu.setText("⏳ Menguji…")
+        self.lbl_hw.setText(f"Menguji {sel_dev.upper()} — memuat model & warmup inference…")
+
+        QThreadPool.globalInstance().start(
+            _PreflightWorker(model_p, sel_dev, self._preflight_signals)
+        )
+
+    def _on_preflight_ready(self, res: dict) -> None:
+        self._preflight_running = False
+        self.btn_test_gpu.setEnabled(True)
+        self.btn_test_gpu.setText("Cek && Uji GPU")
+
+        # Refresh label hardware (cache hit — get_hardware_summary sudah dipanggil worker)
         try:
-            res = run_gpu_preflight_probe(model_p, sel_dev)
-        finally:
-            QApplication.restoreOverrideCursor()
+            self._probe_ready = True
+            self.lbl_hw.setText(self._detect_hardware_summary())
+            sel_dev = str(self.device_combo.currentData() or "auto")
+            plan = describe_compute_plan(sel_dev)
+            self.lbl_compute_preview.setText(self._format_compute_preview(plan))
+        except Exception:
+            pass
 
         if not res.get("probe_ok"):
             QMessageBox.warning(
-                self,
-                "Cek GPU Gagal",
+                self, "Cek GPU Gagal",
                 f"Gagal menguji model ONNX:\n{res.get('probe_error', 'Error tidak diketahui')}",
             )
             return
 
-        speed_line = f"• Latensi ONNX ({res['active_provider']}): {res['infer_ms']} ms/frame (warmup {res['warmup_ms']} ms)"
+        speed_line = (
+            f"• Latensi ONNX ({res['active_provider']}): "
+            f"{res['infer_ms']} ms/frame (warmup {res['warmup_ms']} ms)"
+        )
         if res.get("cpu_infer_ms") is not None:
             speed_line += f"\n• Pembanding CPU (CPUExecutionProvider): {res['cpu_infer_ms']} ms/frame"
+
         msg = (
-            f"Mode Dipilih: {str(sel_dev).upper()}\n\n"
+            f"Mode Dipilih: {str(self.device_combo.currentData() or 'auto').upper()}\n\n"
             f"• Tracking Frame & Deteksi ONNX: {res['active_provider']}\n"
             f"• Stitching ALIKED/LightGlue: {res['stitch_device']}\n"
             f"{speed_line}\n"
@@ -352,6 +405,12 @@ class SettingsDialog(QDialog):
         if res.get("hint"):
             msg += f"\nCatatan:\n{res['hint']}"
         QMessageBox.information(self, "Hasil Cek & Uji Perangkat GPU", msg)
+
+    def _on_preflight_error(self, err: str) -> None:
+        self._preflight_running = False
+        self.btn_test_gpu.setEnabled(True)
+        self.btn_test_gpu.setText("Cek && Uji GPU")
+        QMessageBox.critical(self, "Cek GPU Gagal", f"Terjadi error tak terduga:\n{err}")
 
     # ------------------------------------------------------------ Login
 
@@ -369,8 +428,7 @@ class SettingsDialog(QDialog):
             token = client.login(username=username, password=password)
             self.token_edit.setText(token)
             QMessageBox.information(
-                self,
-                "Login Berhasil",
+                self, "Login Berhasil",
                 "Berhasil login ke Halotec OCR Service!\nToken baru telah tersimpan dan siap digunakan.",
             )
         except Exception as e:

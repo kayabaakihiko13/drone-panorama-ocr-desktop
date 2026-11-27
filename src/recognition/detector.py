@@ -134,12 +134,45 @@ def nms_cpu(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float) -> List
 
 def _cuda_hardware_ready() -> bool:
     """Return True only when an NVIDIA CUDA device is actually usable (not merely compiled into ORT)."""
+    return bool(get_hardware_summary()["cuda_available"])
+
+@lru_cache(maxsize=1)
+def get_hardware_summary() -> Dict[str, Any]:
+    """
+    Cache info hardware process-wide — torch import + CUDA init hanya sekali.
+
+    Hardware tidak berubah selama aplikasi berjalan, jadi cache aman.
+    Panggil `clear_hardware_cache()` setelah update driver / plug GPU.
+    """
+    cuda_avail = False
+    cuda_name = ""
+    torch_ver = "unknown"
     try:
         import torch
-        return bool(torch.cuda.is_available())
+        torch_ver = str(torch.__version__)
+        cuda_avail = bool(torch.cuda.is_available())
+        if cuda_avail:
+            cuda_name = str(torch.cuda.get_device_name(0))
     except Exception:
-        return False
+        pass
 
+    try:
+        avail_providers = sorted(ort.get_available_providers())
+    except Exception:
+        avail_providers = ["CPUExecutionProvider"]
+
+    return {
+        "cuda_available": cuda_avail,
+        "cuda_name": cuda_name,
+        "torch_version": torch_ver,
+        "available_providers": avail_providers,
+        "has_dml": "DmlExecutionProvider" in avail_providers,
+        "has_cuda_ort": "CUDAExecutionProvider" in avail_providers,
+    }
+
+
+def clear_hardware_cache() -> None:
+    get_hardware_summary.cache_clear()
 
 def _ensure_cuda_dlls_loaded() -> None:
     """Register bundled torch/nvidia DLL dirs (frozen .exe) and preload CUDA DLLs before ORT CUDA session."""
@@ -168,14 +201,19 @@ def _ensure_cuda_dlls_loaded() -> None:
             pass
 
 
-def resolve_onnx_providers(device: str = "cpu") -> Tuple[List[str], str]:
-    """
-    Resolve prioritized ONNX Runtime ExecutionProviders from requested device ('cpu', 'auto', 'cuda', 'dml').
-    Always falls back cleanly to CPUExecutionProvider if the GPU provider is unavailable.
-    """
-    avail = set(ort.get_available_providers())
-    if "CUDAExecutionProvider" in avail and not _cuda_hardware_ready():
+def resolve_onnx_providers(
+    device: str = "cpu",
+    avail_providers: Optional[set] = None,
+) -> Tuple[List[str], str]:
+    """Resolve prioritized ONNX Runtime ExecutionProviders."""
+    if avail_providers is None:
+        avail_providers = set(ort.get_available_providers())
+    avail = set(avail_providers)
+
+    hw = get_hardware_summary()
+    if "CUDAExecutionProvider" in avail and not hw["cuda_available"]:
         avail.discard("CUDAExecutionProvider")
+
     req = (device or "cpu").strip().lower()
     preferred: List[str] = []
     if req == "cpu":
@@ -184,7 +222,7 @@ def resolve_onnx_providers(device: str = "cpu") -> Tuple[List[str], str]:
         preferred = ["CUDAExecutionProvider", "DmlExecutionProvider", "CPUExecutionProvider"]
     elif req == "dml":
         preferred = ["DmlExecutionProvider", "CPUExecutionProvider"]
-    else:  # "auto" prefers discrete CUDA GPU when available, else fast CPU (avoid slow iGPU DML stalls)
+    else:  # "auto"
         preferred = ["CUDAExecutionProvider", "CPUExecutionProvider"]
 
     providers = [p for p in preferred if p in avail]
@@ -203,7 +241,9 @@ class OnnxDetector:
 
         self.requested_device = (device or "cpu").strip().lower()
         opts = ort.SessionOptions()
-        opts.intra_op_num_threads = 4
+        # Adaptif: ~50% core, clamp 2..8 agar tidak over-subscribe laptop hemat daya
+        cpu_count = os.cpu_count() or 4
+        opts.intra_op_num_threads = max(2, min(8, cpu_count // 2))
         opts.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
         opts.graph_optimization_level = ort.GraphOptimizationLevel.ORT_ENABLE_ALL
 
@@ -346,32 +386,25 @@ class OnnxDetector:
 # ---------------------------------------------------------------------------
 
 def describe_compute_plan_impl(device: str = "auto") -> Dict[str, Any]:
-    """
-    Summarize exact runtime compute device per pipeline stage without loading models.
-    Reused by SettingsDialog preview and pre-run MainWindow confirmation.
-    """
+    """Summary runtime compute device per pipeline stage — O(cache hit)."""
     req = (device or "cpu").strip().lower()
-    avail = set(ort.get_available_providers())
-    _, onnx_prov = resolve_onnx_providers(req)
 
-    cuda_avail = False
-    cuda_name = ""
-    torch_ver = "unknown"
-    try:
-        import torch
-        torch_ver = str(torch.__version__)
-        cuda_avail = bool(torch.cuda.is_available())
-        if cuda_avail:
-            cuda_name = str(torch.cuda.get_device_name(0))
-    except Exception:
-        pass
+    hw = get_hardware_summary()                          # import torch, cached
+    avail = set(hw["available_providers"])
+    _, onnx_prov = resolve_onnx_providers(req, avail)    # pakai avail yang sama
 
-    has_dml = "DmlExecutionProvider" in avail
-    has_cuda_ort = ("CUDAExecutionProvider" in avail) and cuda_avail
+    cuda_avail = hw["cuda_available"]
+    cuda_name = hw["cuda_name"]
+    torch_ver = hw["torch_version"]
+    has_dml = hw["has_dml"]
+    has_cuda_ort = hw["has_cuda_ort"] and cuda_avail
 
     if req in ("auto", "cuda") and cuda_avail:
         stitch_dev = f"GPU NVIDIA CUDA ({cuda_name or 'cuda:0'})"
-        track_prov = "CUDAExecutionProvider" if has_cuda_ort else ("DmlExecutionProvider" if has_dml else "CPUExecutionProvider")
+        track_prov = (
+            "CUDAExecutionProvider" if has_cuda_ort
+            else ("DmlExecutionProvider" if has_dml else "CPUExecutionProvider")
+        )
     elif req in ("dml", "cuda") and has_dml:
         stitch_dev = "CPU (PyTorch — DirectML hanya untuk ONNX)"
         track_prov = "DmlExecutionProvider"
@@ -379,6 +412,7 @@ def describe_compute_plan_impl(device: str = "auto") -> Dict[str, Any]:
         stitch_dev = "CPU (PyTorch)"
         track_prov = onnx_prov
 
+    # ==== Blok hint HARUS ADA — inilah yang hilang di kode Anda ====
     if req == "auto" and not cuda_avail and has_dml:
         hint = (
             "Mode 'Auto' memakai CPU karena GPU NVIDIA CUDA tidak tersedia "
@@ -412,7 +446,6 @@ def describe_compute_plan_impl(device: str = "auto") -> Dict[str, Any]:
         "hint": hint,
     }
 
-
 @lru_cache(maxsize=8)
 def _describe_compute_plan_cached(device_key: str) -> Dict[str, Any]:
     return describe_compute_plan_impl(device_key)
@@ -432,8 +465,9 @@ def describe_compute_plan(device: str = "auto") -> Dict[str, Any]:
 
 
 def clear_compute_plan_cache() -> None:
-    """Clear cache — useful if hardware state changes (rare) or in unit tests."""
+    """Clear semua cache device — panggil jika hardware berubah (jarang)."""
     _describe_compute_plan_cached.cache_clear()
+    clear_hardware_cache()
 
 
 def run_gpu_preflight_probe(model_path: Path | str, device: str = "auto") -> Dict[str, Any]:
