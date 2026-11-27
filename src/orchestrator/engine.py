@@ -395,6 +395,8 @@ class Orchestrator(threading.Thread):
                     self._handle_manual_override(cmd)
                 elif action == "RE_OCR_CROP":
                     self._handle_re_ocr_crop(cmd)
+                elif action == "MANUAL_ISO_OVERRIDE":
+                    self._handle_manual_iso_override(cmd)
                 elif action == "UPDATE_CONFIG":
                     self._handle_update_config(cmd)
             except Exception as e:
@@ -2527,114 +2529,180 @@ class Orchestrator(threading.Thread):
 
     def _handle_re_ocr_crop(self, cmd: Dict[str, Any]) -> None:
         det_id = cmd.get("detection_id")
-        container_id = cmd.get("container_id")
         job_id = cmd.get("job_id") or self._current_job_id
         img_path = cmd.get("image_path")
-        det_type = cmd.get("detection_type") or "container_number"
-        cam_pos = cmd.get("camera_position") or "rear"
-
-        if not img_path or not Path(img_path).is_file():
-            return
-        if not det_id and not (det_type == "iso_code" and container_id):
+        det_type = cmd.get("detection_type")
+        
+        if not det_id or not img_path or not Path(img_path).is_file():
             return
 
         try:
-            # 1. Panggil Halotec OCR API
             raw_text, confidence = self.ocr_client.recognize_image_file(
                 Path(img_path),
                 detection_type=det_type,
-                camera_position=cam_pos,
+                camera_position="rear",
                 req_id=job_id or 1,
-                context_info=f"Re-OCR Manual (Det ID: {det_id})",
+                context_info=f"Re-OCR Manual (Det ID: {det_id})"
             )
-
-            # 2. Validasi & bersihkan teks
+            
             is_valid = False
             clean_text = raw_text.strip().upper()
-
+            
             if det_type == "container_number":
                 iso_res = validate_iso6346(raw_text)
                 is_valid = iso_res.is_valid
                 clean_text = iso_res.clean_number if iso_res.clean_number else clean_text
-            elif det_type == "iso_code":
-                is_valid, clean_text, _err = validate_iso_size_type(raw_text)
 
-            if det_type == "iso_code" and not is_valid:
-                # Jangan simpan hasil yang bukan kode ISO (mis. nomor kontainer) ke kolom ISO.
-                self._emit_event(
-                    OrchestratorEvent(
-                        type="CONTAINER_PROCESSED",
-                        job_id=int(job_id or 0),
-                        data={
-                            "reocr": True,
-                            "success": False,
-                            "message": f"Re-OCR ISO gagal: '{raw_text or '-'}' bukan kode ISO valid",
-                        },
-                    )
-                )
-                return
-            if not clean_text:
-                self._emit_event(
-                    OrchestratorEvent(
-                        type="CONTAINER_PROCESSED",
-                        job_id=int(job_id or 0),
-                        data={"reocr": True, "success": False, "message": "Re-OCR tidak menghasilkan teks"},
-                    )
-                )
-                return
-
-            # 3. Update Database (buat baris ISO baru bila belum ada)
-            if not det_id and det_type == "iso_code":
-                det_id = self.db.add_detection(
-                    container_id=int(container_id),
-                    detection_type="iso_code",
-                    bbox_x=0,
-                    bbox_y=0,
-                    bbox_w=0,
-                    bbox_h=0,
-                    confidence=float(confidence),
-                    crop_image_path=str(img_path),
-                    ocr_raw_text=raw_text,
-                    ocr_clean_text=clean_text,
-                    is_valid_iso=is_valid,
-                )
-            else:
-                self.db.update_detection_after_reocr(
-                    detection_id=int(det_id),
-                    new_crop_path=str(img_path),
-                    raw_text=raw_text,
-                    clean_text=clean_text,
-                    is_valid_iso=is_valid,
-                    confidence=float(confidence),
-                )
-
-            # 4. Kirim event ke UI agar tabel refresh
+            self.db.update_detection_after_reocr(
+                detection_id=int(det_id),
+                new_crop_path=str(img_path),
+                raw_text=raw_text,
+                clean_text=clean_text,
+                is_valid_iso=is_valid,
+                confidence=float(confidence)
+            )
+            
             self._emit_event(
                 OrchestratorEvent(
                     type="CONTAINER_PROCESSED",
                     job_id=int(job_id or 0),
-                    data={"message": f"Re-OCR sukses untuk deteksi #{det_id}", "reocr": True},
+                    data={"message": f"Re-OCR sukses untuk deteksi #{det_id}"}
                 )
             )
-
         except Exception as e:
             import traceback
-            tb = traceback.format_exc()
             self._emit_event(
                 OrchestratorEvent(
                     type="LOG",
                     job_id=int(job_id or 0),
-                    data={"log": f"[RE-OCR ERROR] det_id={det_id}: {e}\n{tb}"},
+                    data={"log": f"[RE-OCR ERROR] det_id={det_id}: {e}\n{traceback.format_exc()}"},
                 )
             )
+
+    def _handle_manual_iso_override(self, cmd: Dict[str, Any]) -> None:
+        container_id = cmd.get("container_id")
+        text = cmd.get("text", "").strip().upper()
+        job_id = cmd.get("job_id") or self._current_job_id
+
+        if not container_id or not text:
+            return
+
+        is_valid, clean_text, err_msg = validate_iso_size_type(text)
+        
+        if not is_valid:
+            self._emit_event(
+                OrchestratorEvent(
+                    type="LOG",
+                    job_id=int(job_id or 0),
+                    data={"log": f"[MANUAL ISO DITOLAK] ID={container_id}: {err_msg}"},
+                )
+            )
+            return
+
+        try:
+            self.db.upsert_iso_detection(
+                container_id=int(container_id),
+                text=clean_text,
+                is_valid_iso=True
+            )
+            try:
+                self.db.log_audit("INFO", f"Manual ISO override container {container_id}: '{clean_text}'", job_id=job_id)
+            except Exception:
+                pass
+
             self._emit_event(
                 OrchestratorEvent(
                     type="CONTAINER_PROCESSED",
                     job_id=int(job_id or 0),
-                    data={"reocr": True, "success": False, "message": f"Re-OCR gagal: {e}"},
+                    data={"message": f"Koreksi ISO tersimpan: {clean_text}"},
                 )
             )
+        except Exception as e:
+            import traceback
+            self._emit_event(
+                OrchestratorEvent(
+                    type="LOG",
+                    job_id=int(job_id or 0),
+                    data={"log": f"[MANUAL ISO ERROR] {e}\n{traceback.format_exc()}"},
+                )
+            )
+
     
+    def _handle_manual_iso_override(self, cmd: Dict[str, Any]) -> None:
+        container_id = cmd.get("container_id")
+        text = str(cmd.get("text", "")).strip().upper()
+        job_id = cmd.get("job_id") or self._current_job_id
+        event_job_id = int(job_id or 0)
+
+        if not container_id or not text:
+            self._emit_event(
+                OrchestratorEvent(
+                    type="MANUAL_ISO_OVERRIDE_FAILED",
+                    job_id=event_job_id,
+                    data={"container_id": container_id, "error": "Container ID atau ISO Code kosong."},
+                )
+            )
+            return
+
+        is_valid, clean_text, err_msg = validate_iso_size_type(text)
+        if not is_valid:
+            error_text = str(err_msg or "Format ISO 6346 tidak valid")
+            self._emit_event(
+                OrchestratorEvent(
+                    type="MANUAL_ISO_OVERRIDE_FAILED",
+                    job_id=event_job_id,
+                    data={"container_id": container_id, "error": error_text},
+                )
+            )
+            self._emit_event(
+                OrchestratorEvent(
+                    type="LOG",
+                    job_id=event_job_id,
+                    data={"log": f"[MANUAL ISO DITOLAK] container_id={container_id}: {error_text}"},
+                )
+            )
+            return
+
+        try:
+            self.db.upsert_iso_detection(
+                container_id=int(container_id),
+                text=clean_text,
+                is_valid_iso=True,
+            )
+            try:
+                self.db.log_audit(
+                    "INFO",
+                    f"Manual ISO override container {container_id}: '{clean_text}'",
+                    job_id=job_id,
+                )
+            except Exception:
+                pass
+
+            self._emit_event(
+                OrchestratorEvent(
+                    type="MANUAL_ISO_OVERRIDE_SAVED",
+                    job_id=event_job_id,
+                    data={"container_id": int(container_id), "text": clean_text},
+                )
+            )
+        except Exception as e:
+            import traceback
+            error_text = f"{e}"
+            self._emit_event(
+                OrchestratorEvent(
+                    type="MANUAL_ISO_OVERRIDE_FAILED",
+                    job_id=event_job_id,
+                    data={"container_id": container_id, "error": error_text},
+                )
+            )
+            self._emit_event(
+                OrchestratorEvent(
+                    type="LOG",
+                    job_id=event_job_id,
+                    data={"log": f"[MANUAL ISO ERROR] container_id={container_id}: {e}\\n{traceback.format_exc()}"},
+                )
+            )
+
     def _handle_update_config(self, cmd: Dict[str, Any]) -> None:
         new_cfg_dict = cmd.get("config", {})
         if new_cfg_dict:

@@ -378,16 +378,9 @@ class MainWindow(QMainWindow):
                     self.btn_reocr_num.setText("🔄 OCR Ulang")
                     self.btn_reocr_iso.setEnabled(True)
                     self.btn_reocr_iso.setText("🔄 OCR Ulang")
-                    if hasattr(self, 'btn_save_iso'):
-                        self.btn_save_iso.setEnabled(True)
-                        self.btn_save_iso.setText("Simpan ISO")
 
-                    # Tampilkan notifikasi hanya untuk aksi manual/re-OCR,
-                    # bukan setiap container yang diproses otomatis.
                     message = str(evt.data.get("message", "")).strip()
                     if message.startswith("Re-OCR sukses"):
-                        self.show_toast(message, "success", 6000)
-                    elif message.startswith("Koreksi ISO tersimpan"):
                         self.show_toast(message, "success", 6000)
             elif evt.type == "JOB_COMPLETED":
                 self._set_start_button_state(False)
@@ -420,6 +413,26 @@ class MainWindow(QMainWindow):
                 )
                 if evt.job_id == self.current_job_id:
                     self._load_containers_for_job(self.current_job_id)
+            elif evt.type == "MANUAL_ISO_OVERRIDE_SAVED":
+                # Pulihkan tombol tanpa bergantung pada job yang sedang dipilih.
+                self.btn_save_iso.setEnabled(True)
+                self.btn_save_iso.setText("Simpan ISO")
+                saved_text = str(evt.data.get("text", "")).strip()
+                self._append_activity_log(
+                    f"[{now_str}] [MANUAL ISO SUKSES] container_id={evt.data.get('container_id')} "
+                    f"ISO={saved_text} tersimpan pada job #{evt.job_id}"
+                )
+                self.show_toast(f"Koreksi ISO berhasil disimpan: {saved_text}", "success", 6000)
+                if self.current_job_id == evt.job_id:
+                    self._load_containers_for_job(evt.job_id)
+            elif evt.type == "MANUAL_ISO_OVERRIDE_FAILED":
+                self.btn_save_iso.setEnabled(True)
+                self.btn_save_iso.setText("Simpan ISO")
+                error_text = str(evt.data.get("error", "Penyimpanan ISO gagal"))
+                self._append_activity_log(
+                    f"[{now_str}] [MANUAL ISO GAGAL] container_id={evt.data.get('container_id')}: {error_text}"
+                )
+                self.show_toast(f"Koreksi ISO gagal: {error_text}", "error", 8000)
             elif evt.type == "LOG":
                 log_entry = evt.data.get("log") or evt.data.get("message")
                 if log_entry:
@@ -506,6 +519,8 @@ class MainWindow(QMainWindow):
         self.lbl_iso_feedback_iso.setText("-")
         self.btn_save_override.setEnabled(False)
         self.btn_save_iso.setEnabled(False)
+        self.btn_reocr_num.setEnabled(False)
+        self.btn_reocr_iso.setEnabled(False)
         self.selected_container_id = None
         self.selected_detection_id = None
         self.selected_iso_detection_id = None
@@ -581,12 +596,50 @@ class MainWindow(QMainWindow):
 
     def _on_job_selected(self) -> None:
         selected_rows = self.jobs_table.selectionModel().selectedRows()
-        if not selected_rows: return
+        if not selected_rows:
+            return
+
         row = selected_rows[0].row()
         job_id_item = self.jobs_table.item(row, 0)
-        if job_id_item:
-            self.current_job_id = int(job_id_item.text())
-            self._load_containers_for_job(self.current_job_id)
+        if not job_id_item:
+            return
+
+        job_id = int(job_id_item.text())
+        if job_id != self.current_job_id:
+            # Clear stale selection IDs from the previously selected job.
+            self.selected_container_id = None
+            self.selected_detection_id = None
+            self.selected_iso_detection_id = None
+            self.edit_manual_num.clear()
+            self.edit_manual_iso.clear()
+            self.btn_save_override.setEnabled(False)
+            self.btn_save_iso.setEnabled(False)
+            self._orig_crop_num_pixmap = None
+            self._orig_crop_iso_pixmap = None
+            self.lbl_pano_img.setPixmap(QPixmap())
+            self.lbl_pano_img.setText("Pilih baris kontainer untuk menampilkan citra")
+            self.lbl_crop_num.setPixmap(QPixmap())
+            self.lbl_crop_num.setText("Crop nomor tidak tersedia")
+            self.lbl_crop_iso.setPixmap(QPixmap())
+            self.lbl_crop_iso.setText("Crop ISO code tidak tersedia")
+
+        self.current_job_id = job_id
+        self._load_containers_for_job(job_id)
+
+    @staticmethod
+    def _resolve_saved_path(raw_path: Optional[str]) -> Optional[Path]:
+        """Resolve persisted paths whether they were stored absolute or relative."""
+        if not raw_path:
+            return None
+        path = Path(str(raw_path)).expanduser()
+        candidates = [path] if path.is_absolute() else [BASE_DIR / path, Path.cwd() / path]
+        for candidate in candidates:
+            try:
+                if candidate.is_file():
+                    return candidate.resolve()
+            except OSError:
+                continue
+        return None
 
     def _load_containers_for_job(self, job_id: int) -> None:
         self.btn_play_output.setEnabled(bool(self._get_job_output_video(job_id)))
@@ -691,7 +744,22 @@ class MainWindow(QMainWindow):
                     if item and item.data(Qt.ItemDataRole.UserRole) == self.selected_container_id:
                         selected_row = r
                         break
+            self.container_table.clearSelection()
             self.container_table.selectRow(selected_row)
+            # Explicitly load the selected row even if Qt emits no selection signal.
+            self._on_container_selected()
+        else:
+            self.selected_container_id = None
+            self.selected_detection_id = None
+            self.selected_iso_detection_id = None
+            self.btn_save_override.setEnabled(False)
+            self.btn_save_iso.setEnabled(False)
+            self.lbl_pano_img.setPixmap(QPixmap())
+            self.lbl_pano_img.setText("Job ini belum memiliki data kontainer.")
+            self.lbl_crop_num.setPixmap(QPixmap())
+            self.lbl_crop_num.setText("Crop nomor tidak tersedia")
+            self.lbl_crop_iso.setPixmap(QPixmap())
+            self.lbl_crop_iso.setText("Crop ISO code tidak tersedia")
 
     def _on_container_selected(self) -> None:
         selected_rows = self.container_table.selectionModel().selectedRows()
@@ -727,12 +795,15 @@ class MainWindow(QMainWindow):
         if not containers: return
         c_info = containers[0]
 
-        pano_path = c_info.get("annotated_image_path") or c_info.get("image_path")
-        if pano_path and Path(pano_path).is_file():
-            pix = QPixmap(pano_path)
+        pano_path = self._resolve_saved_path(
+            c_info.get("annotated_image_path") or c_info.get("image_path")
+        )
+        if pano_path:
+            pix = QPixmap(str(pano_path))
             scaled = pix.scaled(self.lbl_pano_img.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             self.lbl_pano_img.setPixmap(scaled)
         else:
+            self.lbl_pano_img.setPixmap(QPixmap())
             self.lbl_pano_img.setText("Citra panorama tidak ditemukan.")
 
         self.lbl_crop_num.setText("Crop nomor tidak tersedia")
@@ -743,15 +814,23 @@ class MainWindow(QMainWindow):
         self._orig_crop_iso_pixmap = None
 
         for d in detections:
-            crop_p = d.get("crop_image_path")
-            if crop_p and Path(crop_p).is_file():
-                pix = QPixmap(crop_p)
-                if d["detection_type"] == "container_number":
+            crop_p = self._resolve_saved_path(d.get("crop_image_path"))
+            if crop_p:
+                pix = QPixmap(str(crop_p))
+                if not pix.isNull() and d["detection_type"] == "container_number":
                     self._orig_crop_num_pixmap = pix
                     self._render_crop_image("num")
-                elif d["detection_type"] == "iso_code":
+                elif not pix.isNull() and d["detection_type"] == "iso_code":
                     self._orig_crop_iso_pixmap = pix
                     self._render_crop_image("iso")
+
+        # Restore Re-OCR availability from saved crop files when reopening a job.
+        self.btn_reocr_num.setEnabled(
+            bool(self.selected_detection_id and self._orig_crop_num_pixmap and not self._orig_crop_num_pixmap.isNull())
+        )
+        self.btn_reocr_iso.setEnabled(
+            bool(self.selected_iso_detection_id and self._orig_crop_iso_pixmap and not self._orig_crop_iso_pixmap.isNull())
+        )
 
     def _render_crop_image(self, target: str):
         pixmap = self._orig_crop_num_pixmap if target == "num" else self._orig_crop_iso_pixmap
@@ -895,14 +974,20 @@ class MainWindow(QMainWindow):
         if confirm != QMessageBox.StandardButton.Yes:
             return
 
+        target_job_id = self.current_job_id
+        target_container_id = self.selected_container_id
         self.btn_save_iso.setEnabled(False)
         self.btn_save_iso.setText("Menyimpan...")
+        self._append_activity_log(
+            f"[{datetime.now().strftime('%H:%M:%S')}] [MANUAL ISO] Meminta simpan "
+            f"container_id={target_container_id}, job=#{target_job_id}, ISO={clean_code}"
+        )
 
         self.cmd_queue.put({
             "action": "MANUAL_ISO_OVERRIDE",
-            "container_id": self.selected_container_id, 
+            "container_id": target_container_id,
             "text": clean_code,
-            "job_id": self.current_job_id,
+            "job_id": target_job_id,
         })
         self.show_toast(f"Menyimpan koreksi ISO: {clean_code}...", "info")
 
