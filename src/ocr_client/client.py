@@ -210,6 +210,10 @@ class HalotecOcrClient:
             "image": base64_str,
             "camera_position": cam_pos,
             "camera_type": camera_type,
+            # IMPORTANT: send the requested OCR target to the API.
+            # Previously detection_type was only used locally to parse the response,
+            # so the server could default to container_number even for ISO crops.
+            "detection_type": detection_type,
         }
 
         ctx = context_info or f"Req-{req_id}"
@@ -272,50 +276,85 @@ class HalotecOcrClient:
                     confidence = 0.0
 
                     if isinstance(data, dict):
-                        # 1. Parse standard DataDetection schema: results.container_number / results.iso_code
-                        results = data.get("results") or data.get("data")
-                        if isinstance(results, dict):
-                            target_list = results.get(detection_type, [])
-                            if not target_list and detection_type == "container_number":
-                                target_list = results.get("container_detection", [])
-                            elif not target_list and detection_type == "iso_code":
-                                target_list = results.get("container_number", []) or results.get("container_detection", [])
+                        # API versions may return ISO text under results.iso_code,
+                        # or under the generic container_number/container_detection
+                        # key even when the requested crop is an ISO-size code.
+                        results = data.get("results") or data.get("data") or {}
+                        if not isinstance(results, dict):
+                            results = {}
 
-                            if isinstance(target_list, list) and target_list:
-                                best = max(
-                                    target_list,
-                                    key=lambda x: float(x.get("score_text", x.get("score_bbox", 0.0)))
-                                    if isinstance(x, dict)
-                                    else 0.0,
-                                )
-                                if isinstance(best, dict):
-                                    text = str(best.get("text", "")).strip()
-                                    confidence = float(best.get("score_text", best.get("score_bbox", 0.0)))
+                        def _as_items(value):
+                            if value is None:
+                                return []
+                            if isinstance(value, list):
+                                return value
+                            if isinstance(value, dict):
+                                return [value]
+                            if isinstance(value, str):
+                                return [{"text": value}]
+                            return []
 
-                        # 2. Fallback for flat dictionary responses
+                        def _best_text(items):
+                            valid_items = [x for x in items if isinstance(x, dict) and str(x.get("text", "")).strip()]
+                            if not valid_items:
+                                return "", 0.0
+                            def _score(x):
+                                try:
+                                    return float(x.get("score_text", x.get("score_bbox", x.get("confidence", 0.0))) or 0.0)
+                                except (TypeError, ValueError):
+                                    return 0.0
+                            best_item = max(valid_items, key=_score)
+                            try:
+                                score = _score(best_item)
+                            except Exception:
+                                score = 0.0
+                            return str(best_item.get("text", "")).strip(), score
+
+                        # Preferred key for the requested target.
+                        target_keys = [detection_type]
+                        if detection_type == "iso_code":
+                            # Compatibility fallback for OCR services that ignore
+                            # detection_type and return their generic text bucket.
+                            target_keys += ["container_number", "container_detection", "text_detection"]
+                        else:
+                            target_keys += ["container_detection"]
+
+                        for key in target_keys:
+                            candidate_text, candidate_conf = _best_text(_as_items(results.get(key)))
+                            if candidate_text:
+                                text, confidence = candidate_text, candidate_conf
+                                break
+
+                        # Flat and nested fallback fields used by different API versions.
                         if not text:
-                            text = str(
-                                data.get("text")
-                                or data.get("container_number")
-                                or data.get("iso_code")
-                                or ""
-                            ).strip()
-                            confidence = float(data.get("confidence", 0.0))
+                            flat_keys = (["iso_code", "text", "container_number"] if detection_type == "iso_code"
+                                         else ["text", "container_number"])
+                            for key in flat_keys:
+                                value = data.get(key)
+                                if isinstance(value, str) and value.strip():
+                                    text = value.strip()
+                                    break
+                                if isinstance(value, (list, dict)):
+                                    candidate_text, candidate_conf = _best_text(_as_items(value))
+                                    if candidate_text:
+                                        text, confidence = candidate_text, candidate_conf
+                                        break
+                            try:
+                                confidence = float(data.get("confidence", confidence) or confidence or 0.0)
+                            except (TypeError, ValueError):
+                                pass
 
-                        # 3. Normalize ISO size/type code if detection_type == "iso_code"
+                        # Normalize ISO size/type code (e.g. 45G1).
                         if text and detection_type == "iso_code":
                             import re
-                            m = re.findall(r"[0-9A-Z]{2}[GPRUTV][0-9A-Z]", text.upper())
+                            upper_text = text.upper().replace(" ", "")
+                            m = re.findall(r"[0-9A-Z]{2}[GPRUTV][0-9A-Z]", upper_text)
                             if m:
                                 text = m[0]
                             else:
-                                m4 = re.findall(r"[0-9A-Z]{4}", text.upper())
+                                m4 = re.findall(r"[0-9A-Z]{4}", upper_text)
                                 if m4:
                                     text = m4[0]
-
-                    elif isinstance(data, str):
-                        text = data.strip()
-                        confidence = 1.0
 
                     server_msg = "OK"
                     if isinstance(data, dict) and data.get("message"):

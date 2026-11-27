@@ -29,7 +29,7 @@ from src.ocr_client.client import HalotecOcrClient, OcrClientError
 from src.recognition.detector import DetectionBox, OnnxDetector, describe_compute_plan
 from src.stitching.adapter import StitchingAdapter
 from src.utils.image_io import imread_unicode, imwrite_unicode
-from src.utils.iso6346 import validate_iso6346
+from src.utils.iso6346 import validate_iso6346, validate_iso_size_type
 from src.orchestrator.annotation_motion import (
     _project_box_homography,
     box_iou,
@@ -393,6 +393,8 @@ class Orchestrator(threading.Thread):
                     self.cancel_current_job()
                 elif action == "MANUAL_OVERRIDE":
                     self._handle_manual_override(cmd)
+                elif action == "RE_OCR_CROP":
+                    self._handle_re_ocr_crop(cmd)
                 elif action == "UPDATE_CONFIG":
                     self._handle_update_config(cmd)
             except Exception as e:
@@ -1311,20 +1313,19 @@ class Orchestrator(threading.Thread):
                     is_valid_iso=is_valid,
                 )
 
-                if iso_crop_path and best_iso_box is not None:
-                    self.db.add_detection(
-                        container_id=c_db_id,
-                        detection_type="iso_code",
-                        bbox_x=int(best_iso_box[0]),
-                        bbox_y=int(best_iso_box[1]),
-                        bbox_w=int(best_iso_box[2] - best_iso_box[0]),
-                        bbox_h=int(best_iso_box[3] - best_iso_box[1]),
-                        confidence=float(best_iso_conf),
-                        crop_image_path=str(iso_crop_path),
-                        ocr_raw_text=iso_text or "",
-                        ocr_clean_text=iso_text.strip().upper() if iso_text else "-",
-                        is_valid_iso=False,
-                    )
+                self.db.add_detection(
+                    container_id=c_db_id,
+                    detection_type="iso_code",
+                    bbox_x=int(best_iso_box[0]) if best_iso_box else 0,
+                    bbox_y=int(best_iso_box[1]) if best_iso_box else 0,
+                    bbox_w=int(best_iso_box[2] - best_iso_box[0]) if best_iso_box else 0,
+                    bbox_h=int(best_iso_box[3] - best_iso_box[1]) if best_iso_box else 0,
+                    confidence=float(best_iso_conf),
+                    crop_image_path=str(iso_crop_path) if iso_crop_path else None,
+                    ocr_raw_text=iso_text or "",
+                    ocr_clean_text=iso_text.strip().upper() if iso_text else "-",
+                    is_valid_iso=False,
+                )
 
                 # 7. Update progress dan event ke UI
                 v_badge = "VALID ISO 6346" if is_valid else ("CHECK DIGIT TIDAK SESUAI" if clean_text and clean_text != "-" else "NO TEXT")
@@ -2162,20 +2163,19 @@ class Orchestrator(threading.Thread):
                     is_valid_iso=is_valid,
                 )
 
-                if iso_crop_path and t.best_ib is not None:
-                    self.db.add_detection(
-                        container_id=c_db_id,
-                        detection_type="iso_code",
-                        bbox_x=int(t.best_ib.x1),
-                        bbox_y=int(t.best_ib.y1),
-                        bbox_w=int(t.best_ib.width),
-                        bbox_h=int(t.best_ib.height),
-                        confidence=float(t.best_ib.confidence),
-                        crop_image_path=str(iso_crop_path),
-                        ocr_raw_text=iso_text or "",
-                        ocr_clean_text=iso_text.strip().upper() if iso_text else "-",
-                        is_valid_iso=False,
-                    )
+                self.db.add_detection(
+                    container_id=c_db_id,
+                    detection_type="iso_code",
+                    bbox_x=int(t.best_ib.x1) if t.best_ib is not None else 0,
+                    bbox_y=int(t.best_ib.y1) if t.best_ib is not None else 0,
+                    bbox_w=int(t.best_ib.width) if t.best_ib is not None else 0,
+                    bbox_h=int(t.best_ib.height) if t.best_ib is not None else 0,
+                    confidence=float(t.best_ib.confidence) if t.best_ib is not None else 0.0,
+                    crop_image_path=str(iso_crop_path) if iso_crop_path else None,
+                    ocr_raw_text=iso_text or "",
+                    ocr_clean_text=iso_text.strip().upper() if iso_text else "-",
+                    is_valid_iso=False,
+                )
 
                 # 5. Kirim update real-time ke UI
                 v_badge = "VALID ISO 6346" if is_valid else ("CHECK DIGIT TIDAK SESUAI" if clean_text and clean_text != "-" else "NO TEXT")
@@ -2439,11 +2439,22 @@ class Orchestrator(threading.Thread):
 
     def _handle_manual_override(self, cmd: Dict[str, Any]) -> None:
         detection_id = cmd.get("detection_id")
+        container_id = cmd.get("container_id")
+        det_type = cmd.get("detection_type") or "container_number"
         text = cmd.get("text", "").strip().upper()
-        if not detection_id or not text:
+        if not text:
+            return
+        if det_type != "iso_code" and not detection_id:
+            return
+        if det_type == "iso_code" and not detection_id and not container_id:
             return
 
-        iso_res = validate_iso6346(text)
+        if det_type == "iso_code":
+            is_valid, clean_text, _err = validate_iso_size_type(text)
+            text = clean_text or text
+        else:
+            iso_res = validate_iso6346(text)
+            is_valid = iso_res.is_valid
 
         try:
             # Resolve job_id yang benar untuk UI filter.
@@ -2451,7 +2462,7 @@ class Orchestrator(threading.Thread):
             event_job_id: Optional[int] = cmd.get("job_id")
             if event_job_id is None:
                 event_job_id = self._current_job_id
-            if event_job_id is None:
+            if event_job_id is None and detection_id:
                 try:
                     with self.db._get_connection() as conn:
                         r = conn.execute(
@@ -2467,15 +2478,22 @@ class Orchestrator(threading.Thread):
                 except Exception:
                     event_job_id = None
 
-            self.db.update_detection_manual_override(
-                detection_id=int(detection_id),
-                manual_override_text=text,
-                is_valid_iso=iso_res.is_valid,
-            )
+            if det_type == "iso_code" and not detection_id:
+                detection_id = self.db.upsert_iso_detection(
+                    container_id=int(container_id),
+                    text=text,
+                    is_valid_iso=is_valid,
+                )
+            else:
+                self.db.update_detection_manual_override(
+                    detection_id=int(detection_id),
+                    manual_override_text=text,
+                    is_valid_iso=is_valid,
+                )
             try:
                 self.db.log_audit(
                     "INFO",
-                    f"Manual override detection {detection_id}: '{text}' (ISO valid: {iso_res.is_valid})",
+                    f"Manual override {det_type} detection {detection_id}: '{text}' (valid: {is_valid})",
                     job_id=event_job_id,
                 )
             except Exception:
@@ -2487,8 +2505,9 @@ class Orchestrator(threading.Thread):
                     job_id=int(event_job_id or 0),
                     data={
                         "detection_id": int(detection_id),
+                        "detection_type": det_type,
                         "text": text,
-                        "is_valid": iso_res.is_valid,
+                        "is_valid": is_valid,
                     },
                 )
             )
@@ -2506,6 +2525,116 @@ class Orchestrator(threading.Thread):
             except Exception:
                 print(f"[FATAL] Manual override gagal: {e}\n{tb}")
 
+    def _handle_re_ocr_crop(self, cmd: Dict[str, Any]) -> None:
+        det_id = cmd.get("detection_id")
+        container_id = cmd.get("container_id")
+        job_id = cmd.get("job_id") or self._current_job_id
+        img_path = cmd.get("image_path")
+        det_type = cmd.get("detection_type") or "container_number"
+        cam_pos = cmd.get("camera_position") or "rear"
+
+        if not img_path or not Path(img_path).is_file():
+            return
+        if not det_id and not (det_type == "iso_code" and container_id):
+            return
+
+        try:
+            # 1. Panggil Halotec OCR API
+            raw_text, confidence = self.ocr_client.recognize_image_file(
+                Path(img_path),
+                detection_type=det_type,
+                camera_position=cam_pos,
+                req_id=job_id or 1,
+                context_info=f"Re-OCR Manual (Det ID: {det_id})",
+            )
+
+            # 2. Validasi & bersihkan teks
+            is_valid = False
+            clean_text = raw_text.strip().upper()
+
+            if det_type == "container_number":
+                iso_res = validate_iso6346(raw_text)
+                is_valid = iso_res.is_valid
+                clean_text = iso_res.clean_number if iso_res.clean_number else clean_text
+            elif det_type == "iso_code":
+                is_valid, clean_text, _err = validate_iso_size_type(raw_text)
+
+            if det_type == "iso_code" and not is_valid:
+                # Jangan simpan hasil yang bukan kode ISO (mis. nomor kontainer) ke kolom ISO.
+                self._emit_event(
+                    OrchestratorEvent(
+                        type="CONTAINER_PROCESSED",
+                        job_id=int(job_id or 0),
+                        data={
+                            "reocr": True,
+                            "success": False,
+                            "message": f"Re-OCR ISO gagal: '{raw_text or '-'}' bukan kode ISO valid",
+                        },
+                    )
+                )
+                return
+            if not clean_text:
+                self._emit_event(
+                    OrchestratorEvent(
+                        type="CONTAINER_PROCESSED",
+                        job_id=int(job_id or 0),
+                        data={"reocr": True, "success": False, "message": "Re-OCR tidak menghasilkan teks"},
+                    )
+                )
+                return
+
+            # 3. Update Database (buat baris ISO baru bila belum ada)
+            if not det_id and det_type == "iso_code":
+                det_id = self.db.add_detection(
+                    container_id=int(container_id),
+                    detection_type="iso_code",
+                    bbox_x=0,
+                    bbox_y=0,
+                    bbox_w=0,
+                    bbox_h=0,
+                    confidence=float(confidence),
+                    crop_image_path=str(img_path),
+                    ocr_raw_text=raw_text,
+                    ocr_clean_text=clean_text,
+                    is_valid_iso=is_valid,
+                )
+            else:
+                self.db.update_detection_after_reocr(
+                    detection_id=int(det_id),
+                    new_crop_path=str(img_path),
+                    raw_text=raw_text,
+                    clean_text=clean_text,
+                    is_valid_iso=is_valid,
+                    confidence=float(confidence),
+                )
+
+            # 4. Kirim event ke UI agar tabel refresh
+            self._emit_event(
+                OrchestratorEvent(
+                    type="CONTAINER_PROCESSED",
+                    job_id=int(job_id or 0),
+                    data={"message": f"Re-OCR sukses untuk deteksi #{det_id}", "reocr": True},
+                )
+            )
+
+        except Exception as e:
+            import traceback
+            tb = traceback.format_exc()
+            self._emit_event(
+                OrchestratorEvent(
+                    type="LOG",
+                    job_id=int(job_id or 0),
+                    data={"log": f"[RE-OCR ERROR] det_id={det_id}: {e}\n{tb}"},
+                )
+            )
+            self._emit_event(
+                OrchestratorEvent(
+                    type="CONTAINER_PROCESSED",
+                    job_id=int(job_id or 0),
+                    data={"reocr": True, "success": False, "message": f"Re-OCR gagal: {e}"},
+                )
+            )
+    
     def _handle_update_config(self, cmd: Dict[str, Any]) -> None:
         new_cfg_dict = cmd.get("config", {})
         if new_cfg_dict:

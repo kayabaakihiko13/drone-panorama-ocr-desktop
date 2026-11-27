@@ -306,7 +306,34 @@ class Database:
                 """,
                 (crop_image_path, ocr_raw_text, ocr_clean_text, 1 if is_valid_iso else 0, detection_id),
             )
-
+    def update_detection_after_reocr(
+        self,
+        detection_id: int,
+        new_crop_path: str,
+        raw_text: str,
+        clean_text: str,
+        is_valid_iso: bool,
+        confidence: float,
+    ) -> None:
+        """Mengupdate hasil deteksi setelah proses Re-OCR (rotasi gambar)."""
+        with self._lock, self._get_connection() as conn:
+            conn.execute(
+                """
+                UPDATE detections
+                SET crop_image_path = ?, ocr_raw_text = ?, ocr_clean_text = ?, 
+                    is_valid_iso = ?, confidence = ?, is_reviewed = 0,
+                    manual_override_text = NULL
+                WHERE id = ?
+                """,
+                (
+                    new_crop_path,
+                    raw_text,
+                    clean_text,
+                    1 if is_valid_iso else 0,
+                    confidence,
+                    detection_id,
+                ),
+            )
     def update_detection_manual_override(
         self,
         detection_id: int,
@@ -322,6 +349,60 @@ class Database:
                 """,
                 (manual_override_text, 1 if is_valid_iso else 0, detection_id),
             )
+
+    def upsert_iso_detection(
+        self,
+        container_id: int,
+        text: str,
+        is_valid_iso: bool,
+        crop_image_path: Optional[str] = None,
+        confidence: float = 0.0,
+    ) -> int:
+        """Creates or updates the iso_code detection row for a container.
+
+        Used by manual correction / re-OCR when the ISO code was never detected,
+        so the operator can still record a value.
+        """
+        now = datetime.now().isoformat()
+        with self._lock, self._get_connection() as conn:
+            row = conn.execute(
+                "SELECT id FROM detections WHERE container_id = ? AND detection_type = 'iso_code' ORDER BY id ASC LIMIT 1",
+                (container_id,),
+            ).fetchone()
+            if row is not None:
+                detection_id = int(row["id"] if hasattr(row, "keys") else row[0])
+                conn.execute(
+                    """
+                    UPDATE detections
+                    SET manual_override_text = ?, ocr_clean_text = ?, ocr_raw_text = COALESCE(ocr_raw_text, ?),
+                        is_valid_iso = ?, is_reviewed = 1
+                    WHERE id = ?
+                    """,
+                    (text, text, text, 1 if is_valid_iso else 0, detection_id),
+                )
+                return detection_id
+
+            cursor = conn.execute(
+                """
+                INSERT INTO detections (
+                    container_id, detection_type, bbox_x, bbox_y, bbox_w, bbox_h,
+                    confidence, crop_image_path, ocr_raw_text, ocr_clean_text,
+                    is_valid_iso, manual_override_text, is_reviewed, created_at
+                )
+                VALUES (?, 'iso_code', 0, 0, 0, 0, ?, ?, ?, ?, ?, ?, 1, ?)
+                """,
+                (
+                    container_id,
+                    confidence,
+                    crop_image_path,
+                    text,
+                    text,
+                    1 if is_valid_iso else 0,
+                    text,
+                    now,
+                ),
+            )
+            return int(cursor.lastrowid)  # type: ignore
 
     def log_audit(self, level: str, message: str, job_id: Optional[int] = None) -> None:
         now = datetime.now().isoformat()

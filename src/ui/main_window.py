@@ -1,10 +1,5 @@
 """
 Main Application Window (PySide6).
-Follows TDD_Container_OCR_Windows_v1.9.md:
-- UI thread does NOT execute AI models, stitching, or synchronous DB writes.
-- In-process QTimer pulls events from Orchestrator's event_queue.
-- Displays Job history, Container results, ISO 6346 validation badges, RAW Panoramas, and zoomed ROI crops.
-- Provides immediate manual review and correction interface.
 """
 from __future__ import annotations
 
@@ -16,26 +11,10 @@ from typing import Optional
 from PySide6.QtCore import QSize, Qt, QTimer
 from PySide6.QtGui import QColor, QPixmap, QTransform
 from PySide6.QtWidgets import (
-    QApplication,
-    QComboBox,
-    QFileDialog,
-    QGroupBox,
-    QHBoxLayout,
-    QHeaderView,
-    QLabel,
-    QLineEdit,
-    QMainWindow,
-    QMessageBox,
-    QPlainTextEdit,
-    QProgressBar,
-    QPushButton,
-    QSizePolicy,
-    QSplitter,
-    QTableWidget,
-    QTableWidgetItem,
-    QTabWidget,
-    QVBoxLayout,
-    QWidget,
+    QApplication, QAbstractItemView, QComboBox, QFileDialog, QGroupBox, QHBoxLayout, QHeaderView,
+    QLabel, QLineEdit, QMainWindow, QMessageBox, QPlainTextEdit, QProgressBar,
+    QPushButton, QSizePolicy, QSplitter, QTableWidget, QTableWidgetItem,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
 from src.config import BASE_DIR, AppConfig
@@ -45,7 +24,7 @@ from src.recognition.detector import describe_compute_plan
 from src.ui.settings_dialog import SettingsDialog
 from src.ui.toast import ElidedLabel, ToastManager
 from src.ui.video_player_dialog import VideoPlayerDialog
-from src.utils.iso6346 import validate_iso6346
+from src.utils.iso6346 import validate_iso6346, validate_iso_size_type
 
 
 class MainWindow(QMainWindow):
@@ -67,9 +46,9 @@ class MainWindow(QMainWindow):
         self.current_job_id: Optional[int] = None
         self.selected_container_id: Optional[int] = None
         self.selected_detection_id: Optional[int] = None
+        self.selected_iso_detection_id: Optional[int] = None
         self.is_job_running = False
 
-        # Menyimpan gambar asli untuk fitur rotasi
         self._orig_crop_num_pixmap: Optional[QPixmap] = None
         self._orig_crop_iso_pixmap: Optional[QPixmap] = None
 
@@ -99,7 +78,6 @@ class MainWindow(QMainWindow):
         self.btn_play_input = QPushButton("▶ Putar Video Input")
         self.btn_play_input.setStyleSheet("font-weight: bold; padding: 6px 12px;")
         self.btn_play_input.setEnabled(False)
-        self.btn_play_input.setToolTip("Putar video drone input yang sedang dipilih")
         self.btn_play_input.clicked.connect(self._on_play_input_video)
         top_bar.addWidget(self.btn_play_input)
 
@@ -151,7 +129,7 @@ class MainWindow(QMainWindow):
         # 2. Main Content Splitter
         main_splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # Left: Job History List and Live Activity Log
+        # Left: Job History & Log
         left_widget = QWidget()
         left_layout = QVBoxLayout(left_widget)
         left_layout.setContentsMargins(0, 0, 0, 0)
@@ -179,11 +157,14 @@ class MainWindow(QMainWindow):
         left_layout.addWidget(self.txt_activity_log)
         main_splitter.addWidget(left_widget)
 
-        # Right: Container Table and Inspection View
+        # Right: Container Table & Preview (Using Vertical Splitter)
         right_widget = QWidget()
         right_layout = QVBoxLayout(right_widget)
         right_layout.setContentsMargins(0, 0, 0, 0)
+        
+        right_vertical_splitter = QSplitter(Qt.Orientation.Vertical)
 
+        # Table Header
         right_header_lay = QHBoxLayout()
         right_header_lay.addWidget(QLabel("<b>Hasil Deteksi & Pengenalan Kontainer (ISO 6346):</b>"))
         self.lbl_container_summary = QLabel("")
@@ -194,7 +175,6 @@ class MainWindow(QMainWindow):
         self.btn_play_output = QPushButton("Putar Video Hasil")
         self.btn_play_output.setStyleSheet("padding: 3px 8px; font-size: 11px; font-weight: bold; background-color: #005a9e; color: white;")
         self.btn_play_output.setEnabled(False)
-        self.btn_play_output.setToolTip("Putar video hasil tracking & anotasi kontainer (.mp4)")
         self.btn_play_output.clicked.connect(self._on_play_output_video)
         right_header_lay.addWidget(self.btn_play_output)
 
@@ -217,31 +197,32 @@ class MainWindow(QMainWindow):
             "ISO 6346 Check", "ISO Code", "Confidence", "Manual Review"
         ])
         self.container_table.horizontalHeader().setSectionResizeMode(3, QHeaderView.ResizeMode.Stretch)
+        self.container_table.setColumnWidth(4, 160)
         self.container_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self.container_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.container_table.itemSelectionChanged.connect(self._on_container_selected)
-        right_layout.addWidget(self.container_table)
+        
+        right_vertical_splitter.addWidget(self.container_table)
 
-        # Bottom Inspection & Preview Splitter
+        # Bottom Inspection View
         preview_group = QGroupBox("Detail Visual & Verifikasi Lapangan (Zero Double-Detection)")
         preview_layout = QVBoxLayout(preview_group)
 
         preview_splitter = QSplitter(Qt.Orientation.Horizontal)
 
-        # Panorama / Container Image View
+        # Panorama
         pano_box = QWidget()
         pano_lay = QVBoxLayout(pano_box)
         pano_lay.setContentsMargins(0, 0, 0, 0)
-        self.lbl_pano_header = QLabel("Citra Kontainer Terdeteksi (RAW / Anotasi Bounding Box):")
-        pano_lay.addWidget(self.lbl_pano_header)
+        pano_lay.addWidget(QLabel("Citra Kontainer Terdeteksi (RAW / Anotasi Bounding Box):"))
         self.lbl_pano_img = QLabel("Pilih baris kontainer untuk menampilkan citra")
         self.lbl_pano_img.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.lbl_pano_img.setStyleSheet("background-color: #1e1e1e; color: #aaa; border: 1px solid #444;")
-        self.lbl_pano_img.setMinimumHeight(240)
+        self.lbl_pano_img.setMinimumHeight(150)
         pano_lay.addWidget(self.lbl_pano_img)
         preview_splitter.addWidget(pano_box)
 
-        # Cropped ROI View (Container Number & ISO Code)
+        # Crops & Re-OCR
         crop_box = QWidget()
         crop_lay = QVBoxLayout(crop_box)
         crop_lay.setContentsMargins(0, 0, 0, 0)
@@ -249,7 +230,7 @@ class MainWindow(QMainWindow):
 
         crop_tabs = QTabWidget()
 
-        # --- Tab Container Number Crop ---
+        # Tab Number
         tab_num = QWidget()
         tab_num_lay = QVBoxLayout(tab_num)
         self.lbl_crop_num = QLabel("Crop Nomor Kontainer")
@@ -257,21 +238,25 @@ class MainWindow(QMainWindow):
         self.lbl_crop_num.setStyleSheet("background-color: #252526; color: #888;")
         tab_num_lay.addWidget(self.lbl_crop_num)
         
-        # Tombol Rotasi untuk Nomor
         num_rot_lay = QHBoxLayout()
         num_rot_lay.addStretch()
         self.btn_rot_num_ccw = QPushButton("⟲ Putar Kiri")
         self.btn_rot_num_cw = QPushButton("⟳ Putar Kanan")
+        self.btn_reocr_num = QPushButton("🔄 OCR Ulang")
+        self.btn_reocr_num.setStyleSheet("background-color: #D83B01; color: white; font-weight: bold;")
+        
         self.btn_rot_num_ccw.clicked.connect(lambda: self._rotate_crop("num", -90))
         self.btn_rot_num_cw.clicked.connect(lambda: self._rotate_crop("num", 90))
+        self.btn_reocr_num.clicked.connect(lambda: self._on_re_ocr_crop("num"))
+        
         num_rot_lay.addWidget(self.btn_rot_num_ccw)
         num_rot_lay.addWidget(self.btn_rot_num_cw)
+        num_rot_lay.addWidget(self.btn_reocr_num)
         num_rot_lay.addStretch()
         tab_num_lay.addLayout(num_rot_lay)
-        
         crop_tabs.addTab(tab_num, "Nomor Kontainer")
 
-        # --- Tab ISO Code Crop ---
+        # Tab ISO
         tab_iso = QWidget()
         tab_iso_lay = QVBoxLayout(tab_iso)
         self.lbl_crop_iso = QLabel("Crop ISO Code")
@@ -279,27 +264,31 @@ class MainWindow(QMainWindow):
         self.lbl_crop_iso.setStyleSheet("background-color: #252526; color: #888;")
         tab_iso_lay.addWidget(self.lbl_crop_iso)
         
-        # Tombol Rotasi untuk ISO
         iso_rot_lay = QHBoxLayout()
         iso_rot_lay.addStretch()
         self.btn_rot_iso_ccw = QPushButton("⟲ Putar Kiri")
         self.btn_rot_iso_cw = QPushButton("⟳ Putar Kanan")
+        self.btn_reocr_iso = QPushButton("🔄 OCR Ulang")
+        self.btn_reocr_iso.setStyleSheet("background-color: #D83B01; color: white; font-weight: bold;")
+        
         self.btn_rot_iso_ccw.clicked.connect(lambda: self._rotate_crop("iso", -90))
         self.btn_rot_iso_cw.clicked.connect(lambda: self._rotate_crop("iso", 90))
+        self.btn_reocr_iso.clicked.connect(lambda: self._on_re_ocr_crop("iso"))
+        
         iso_rot_lay.addWidget(self.btn_rot_iso_ccw)
         iso_rot_lay.addWidget(self.btn_rot_iso_cw)
+        iso_rot_lay.addWidget(self.btn_reocr_iso)
         iso_rot_lay.addStretch()
         tab_iso_lay.addLayout(iso_rot_lay)
-        
         crop_tabs.addTab(tab_iso, "ISO Code")
 
         crop_lay.addWidget(crop_tabs)
         preview_splitter.addWidget(crop_box)
         preview_layout.addWidget(preview_splitter)
 
-        # Quick Manual Correction / Review Bar
+        # Manual Review Bar (Number)
         review_bar = QHBoxLayout()
-        review_bar.addWidget(QLabel("<b>Koreksi Manual:</b>"))
+        review_bar.addWidget(QLabel("<b>Koreksi Manual (Nomor):</b>"))
         self.edit_manual_num = QLineEdit()
         self.edit_manual_num.setPlaceholderText("Edit nomor kontainer...")
         self.edit_manual_num.textChanged.connect(self._on_manual_text_changed)
@@ -312,10 +301,30 @@ class MainWindow(QMainWindow):
         self.btn_save_override.setStyleSheet("background-color: #107C41; color: white; font-weight: bold; padding: 4px 12px;")
         self.btn_save_override.clicked.connect(self._on_save_manual_override)
         review_bar.addWidget(self.btn_save_override)
-
         preview_layout.addLayout(review_bar)
-        right_layout.addWidget(preview_group)
 
+        # Manual Review Bar (ISO)
+        iso_review_bar = QHBoxLayout()
+        iso_review_bar.addWidget(QLabel("<b>Koreksi ISO Code:</b>"))
+        self.edit_manual_iso = QLineEdit()
+        self.edit_manual_iso.setPlaceholderText("Edit ISO (mis. 45G1)...")
+        self.edit_manual_iso.textChanged.connect(self._on_manual_iso_text_changed)
+        iso_review_bar.addWidget(self.edit_manual_iso)
+
+        self.lbl_iso_feedback_iso = QLabel("-")
+        iso_review_bar.addWidget(self.lbl_iso_feedback_iso)
+
+        self.btn_save_iso = QPushButton("Simpan ISO")
+        self.btn_save_iso.setStyleSheet("background-color: #107C41; color: white; font-weight: bold; padding: 4px 12px;")
+        self.btn_save_iso.clicked.connect(self._on_save_manual_iso)
+        iso_review_bar.addWidget(self.btn_save_iso)
+        preview_layout.addLayout(iso_review_bar)
+
+        right_vertical_splitter.addWidget(preview_group)
+        right_vertical_splitter.setStretchFactor(0, 3)
+        right_vertical_splitter.setStretchFactor(1, 2)
+
+        right_layout.addWidget(right_vertical_splitter)
         main_splitter.addWidget(right_widget)
         main_splitter.setStretchFactor(0, 3)
         main_splitter.setStretchFactor(1, 7)
@@ -324,7 +333,6 @@ class MainWindow(QMainWindow):
         self.selected_video_path: Optional[str] = None
 
     def _init_event_timer(self) -> None:
-        """Polls orchestrator events on the Qt UI thread."""
         self.event_timer = QTimer(self)
         self.event_timer.setInterval(100)
         self.event_timer.timeout.connect(self._process_orchestrator_events)
@@ -354,23 +362,33 @@ class MainWindow(QMainWindow):
                 self.show_toast(f"Job {evt.job_id} dimulai...", "info")
                 self.progress_bar.setValue(2)
                 self.txt_activity_log.setPlainText(f"[{now_str}] === MULAI JOB {evt.job_id}: {evt.data.get('name')} ===\n")
-                self.txt_activity_log.appendPlainText(f"[{now_str}] Mode: {evt.data.get('mode')}, Sensor: {evt.data.get('camera_position')}")
                 self._load_jobs()
             elif evt.type == "PROGRESS":
                 pct = int(evt.data.get("progress", 0.0) * 100)
                 self.progress_bar.setValue(pct)
                 msg = evt.data.get("message", "Memproses...")
                 self.lbl_status.setText(msg)
-
                 log_entry = evt.data.get("log")
                 if log_entry:
                     self.txt_activity_log.appendPlainText(f"[{now_str}] {log_entry}")
-                elif msg:
-                    if not msg.startswith("Tahap 1/4: Tracking frame") or pct % 10 == 0:
-                        self.txt_activity_log.appendPlainText(f"[{now_str}] {msg}")
             elif evt.type == "CONTAINER_PROCESSED":
                 if self.current_job_id == evt.job_id:
                     self._load_containers_for_job(evt.job_id)
+                    self.btn_reocr_num.setEnabled(True)
+                    self.btn_reocr_num.setText("🔄 OCR Ulang")
+                    self.btn_reocr_iso.setEnabled(True)
+                    self.btn_reocr_iso.setText("🔄 OCR Ulang")
+                    if hasattr(self, 'btn_save_iso'):
+                        self.btn_save_iso.setEnabled(True)
+                        self.btn_save_iso.setText("Simpan ISO")
+
+                    # Tampilkan notifikasi hanya untuk aksi manual/re-OCR,
+                    # bukan setiap container yang diproses otomatis.
+                    message = str(evt.data.get("message", "")).strip()
+                    if message.startswith("Re-OCR sukses"):
+                        self.show_toast(message, "success", 6000)
+                    elif message.startswith("Koreksi ISO tersimpan"):
+                        self.show_toast(message, "success", 6000)
             elif evt.type == "JOB_COMPLETED":
                 self._set_start_button_state(False)
                 self.progress_bar.setValue(100)
@@ -390,12 +408,16 @@ class MainWindow(QMainWindow):
                 self._set_start_button_state(False)
                 self.progress_bar.setValue(0)
                 self.show_toast("Proses Dibatalkan.", "warning")
-                self.txt_activity_log.appendPlainText(f"[{now_str}] [DIBATALKAN] {evt.data.get('message', 'Proses dibatalkan oleh pengguna.')}\n")
+                self.txt_activity_log.appendPlainText(f"[{now_str}] [DIBATALKAN] {evt.data.get('message', 'Proses dibatalkan.')}\n")
                 self._load_jobs()
             elif evt.type == "MANUAL_OVERRIDE_SAVED":
                 self.btn_save_override.setText("Simpan Koreksi")
                 self.btn_save_override.setEnabled(True)
-                self.show_toast(f"Koreksi tersimpan untuk detection #{evt.data.get('detection_id', '?')}", "success")
+                saved_text = evt.data.get("text", "")
+                self.show_toast(
+                    f"Koreksi nomor container berhasil disimpan{': ' + saved_text if saved_text else ''}",
+                    "success", 6000
+                )
                 if evt.job_id == self.current_job_id:
                     self._load_containers_for_job(self.current_job_id)
             elif evt.type == "LOG":
@@ -405,13 +427,25 @@ class MainWindow(QMainWindow):
                         log_entry = f"[{now_str}] {log_entry}"
                     self.txt_activity_log.appendPlainText(log_entry)
 
+                    # Pulihkan tombol dan beri feedback jika request manual gagal.
+                    lower_log = log_entry.lower()
+                    if "re-ocr error" in lower_log or "reocr error" in lower_log:
+                        self.btn_reocr_num.setEnabled(True)
+                        self.btn_reocr_num.setText("🔄 OCR Ulang")
+                        self.btn_reocr_iso.setEnabled(True)
+                        self.btn_reocr_iso.setText("🔄 OCR Ulang")
+                        self.show_toast("OCR ulang gagal. Periksa log aktivitas dan token/API.", "error", 7000)
+                    elif "manual iso" in lower_log and ("error" in lower_log or "ditolak" in lower_log):
+                        self.btn_save_iso.setEnabled(True)
+                        self.btn_save_iso.setText("Simpan ISO")
+                        self.show_toast("Koreksi ISO gagal disimpan. Periksa format atau log aktivitas.", "error", 7000)
+                    elif "manual override" in lower_log and ("error" in lower_log or "ditolak" in lower_log):
+                        self.btn_save_override.setEnabled(True)
+                        self.btn_save_override.setText("Simpan Koreksi")
+                        self.show_toast("Koreksi nomor container gagal disimpan. Periksa log aktivitas.", "error", 7000)
+
     def _on_select_video(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(
-            self,
-            "Pilih File Video Drone",
-            str(BASE_DIR),
-            "Video Files (*.mp4 *.mov *.avi *.mkv);;All Files (*.*)",
-        )
+        path, _ = QFileDialog.getOpenFileName(self, "Pilih File Video Drone", str(BASE_DIR), "Video Files (*.mp4 *.mov *.avi *.mkv);;All Files (*.*)")
         if path:
             self.selected_video_path = path
             self.btn_new_job.setText(f"📁 {Path(path).name}")
@@ -419,8 +453,7 @@ class MainWindow(QMainWindow):
             self.btn_play_input.setEnabled(True)
 
     def _on_mode_changed(self) -> None:
-        mode = self.mode_combo.currentData()
-        self._update_cam_pos_options(mode)
+        self._update_cam_pos_options(self.mode_combo.currentData())
 
     def _update_cam_pos_options(self, mode: str) -> None:
         self.cam_pos_combo.clear()
@@ -438,197 +471,142 @@ class MainWindow(QMainWindow):
         if running:
             self.btn_start.setText("Batalkan Proses")
             self.btn_start.setEnabled(True)
-            self.btn_start.setStyleSheet(
-                "background-color: #D83B01; color: white; font-weight: bold; padding: 6px 16px; border-radius: 4px;"
-            )
+            self.btn_start.setStyleSheet("background-color: #D83B01; color: white; font-weight: bold; padding: 6px 16px; border-radius: 4px;")
         else:
             self.btn_start.setText("Mulai Proses")
             self.btn_start.setEnabled(True)
-            self.btn_start.setStyleSheet(
-                "background-color: #0078D4; color: white; font-weight: bold; padding: 6px 16px; border-radius: 4px;"
-            )
+            self.btn_start.setStyleSheet("background-color: #0078D4; color: white; font-weight: bold; padding: 6px 16px; border-radius: 4px;")
 
     def _on_start_or_cancel_job(self) -> None:
         if self.is_job_running:
-            reply = QMessageBox.question(
-                self,
-                "Konfirmasi Pembatalan",
-                "Apakah Anda yakin ingin membatalkan proses pemrosesan video yang sedang berjalan?",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
+            reply = QMessageBox.question(self, "Konfirmasi", "Batalkan proses yang berjalan?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if reply == QMessageBox.StandardButton.Yes:
                 self.btn_start.setEnabled(False)
                 self.btn_start.setText("Membatalkan...")
                 self.lbl_status.setText("Membatalkan proses...")
-                if self.orchestrator:
-                    self.orchestrator.cancel_current_job()
+                if self.orchestrator: self.orchestrator.cancel_current_job()
                 self.cmd_queue.put({"action": "CANCEL_JOB"})
         else:
             self._on_start_job()
 
     def _clear_workspace_for_new_job(self) -> None:
-        """Cleans all previous job results, inspection views, and logs cleanly for a fresh start."""
         self.container_table.setRowCount(0)
         self.txt_activity_log.clear()
-        self.lbl_pano_img.setText("Memproses video... Citra kontainer akan tampil otomatis begitu terdeteksi.")
+        self.lbl_pano_img.setText("Memproses video...")
         self.lbl_pano_img.setPixmap(QPixmap())
         self.lbl_crop_num.setText("Menunggu deteksi...")
         self.lbl_crop_num.setPixmap(QPixmap())
         self.lbl_crop_iso.setText("Menunggu deteksi...")
         self.lbl_crop_iso.setPixmap(QPixmap())
-        
         self._orig_crop_num_pixmap = None
         self._orig_crop_iso_pixmap = None
-
         self.edit_manual_num.clear()
+        self.edit_manual_iso.clear()
         self.lbl_iso_feedback.setText("-")
+        self.lbl_iso_feedback_iso.setText("-")
         self.btn_save_override.setEnabled(False)
+        self.btn_save_iso.setEnabled(False)
         self.selected_container_id = None
         self.selected_detection_id = None
+        self.selected_iso_detection_id = None
         self.lbl_container_summary.setText("Memulai proses baru...")
-        self.lbl_container_summary.setStyleSheet("color: #0078D4; font-size: 11px; margin-left: 8px;")
         self.btn_play_output.setEnabled(False)
 
     def _on_start_job(self) -> None:
         if not self.selected_video_path:
-            QMessageBox.warning(self, "Peringatan", "Silakan pilih file video drone terlebih dahulu!")
+            QMessageBox.warning(self, "Peringatan", "Pilih video terlebih dahulu!")
             return
-
-        mode = self.mode_combo.currentData()
-        camera_position = self.cam_pos_combo.currentData() or "left"
-        name = Path(self.selected_video_path).stem
-
-        # Pre-run hardware confirmation so user sees active GPU/CPU per stage before running
-        while True:
-            req_dev = str(getattr(self.config.stitching, "device", "auto") or "auto")
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            try:
-                plan = describe_compute_plan(req_dev)
-            finally:
-                QApplication.restoreOverrideCursor()
-            summary_lines = [
-                f"Video: {Path(self.selected_video_path).name} | Mode: {mode} (Sensor: {camera_position})",
-                f"Pengaturan Komputasi: {req_dev.upper()}",
-                "",
-                f"• Tracking Frame & Deteksi ONNX: {plan['track_provider']}",
-            ]
-            if mode in ("LEFT_RIGHT", "TOP"):
-                summary_lines.append(f"• Stitching Panorama (ALIKED/LightGlue): {plan['stitch_device']}")
-            if plan["hint"]:
-                summary_lines.extend(["", f"Catatan: {plan['hint']}"])
-
-            confirm_box = QMessageBox(self)
-            confirm_box.setWindowTitle("Konfirmasi Perangkat & Mulai Proses")
-            confirm_box.setIcon(
-                QMessageBox.Icon.Information if plan["uses_gpu"] else QMessageBox.Icon.Warning
-            )
-            confirm_box.setText("\n".join(summary_lines))
-            btn_go = confirm_box.addButton("Mulai Proses", QMessageBox.ButtonRole.AcceptRole)
-            btn_cfg = confirm_box.addButton("Ubah di Pengaturan...", QMessageBox.ButtonRole.ActionRole)
-            btn_cancel = confirm_box.addButton("Batal", QMessageBox.ButtonRole.RejectRole)
-            confirm_box.setDefaultButton(btn_go)
-            confirm_box.exec()
-
-            clicked = confirm_box.clickedButton()
-            if clicked == btn_cfg:
-                self._open_settings()
-                continue
-            if clicked != btn_go or clicked == btn_cancel:
-                return
-            break
 
         self._clear_workspace_for_new_job()
         self.cmd_queue.put({
             "action": "START_JOB",
-            "name": name,
+            "name": Path(self.selected_video_path).stem,
             "video_path": self.selected_video_path,
-            "mode": mode,
-            "camera_position": camera_position,
+            "mode": self.mode_combo.currentData(),
+            "camera_position": self.cam_pos_combo.currentData() or "left",
         })
 
     def _load_jobs(self) -> None:
-        jobs = self.db.get_all_jobs()
-        self.jobs_table.setRowCount(len(jobs))
+        """Refresh job history newest-first and keep the active/current job selected."""
+        jobs = self.db.get_all_jobs() or []
+        jobs = sorted(jobs, key=lambda item: int(item.get("id", 0)), reverse=True)
 
-        for row, job in enumerate(jobs):
-            self.jobs_table.setItem(row, 0, QTableWidgetItem(str(job["id"])))
-            self.jobs_table.setItem(row, 1, QTableWidgetItem(job["name"]))
-            self.jobs_table.setItem(row, 2, QTableWidgetItem(job["mode"]))
+        was_blocked = self.jobs_table.blockSignals(True)
+        target_row = None
+        try:
+            self.jobs_table.setRowCount(len(jobs))
 
-            status_item = QTableWidgetItem(job["status"])
-            if job["status"] == "COMPLETED":
-                status_item.setForeground(QColor("#107C41"))
-            elif job["status"] == "PROCESSING":
-                status_item.setForeground(QColor("#0078D4"))
-            elif job["status"] == "FAILED":
-                status_item.setForeground(QColor("#D83B01"))
-            elif job["status"] == "INTERRUPTED":
-                status_item.setForeground(QColor("#FF8C00"))
-            self.jobs_table.setItem(row, 3, status_item)
+            for row, job in enumerate(jobs):
+                job_id = int(job.get("id", 0))
+                self.jobs_table.setItem(row, 0, QTableWidgetItem(str(job_id)))
+                self.jobs_table.setItem(row, 1, QTableWidgetItem(str(job.get("name") or "")))
+                self.jobs_table.setItem(row, 2, QTableWidgetItem(str(job.get("mode") or "")))
 
-        if jobs and self.current_job_id is None:
-            self.jobs_table.selectRow(0)
+                status = str(job.get("status") or "")
+                status_item = QTableWidgetItem(status)
+                if status == "COMPLETED":
+                    status_item.setForeground(QColor("#107C41"))
+                elif status == "PROCESSING":
+                    status_item.setForeground(QColor("#0078D4"))
+                elif status == "FAILED":
+                    status_item.setForeground(QColor("#D83B01"))
+                elif status == "INTERRUPTED":
+                    status_item.setForeground(QColor("#FF8C00"))
+                self.jobs_table.setItem(row, 3, status_item)
+
+                if self.current_job_id is not None and job_id == int(self.current_job_id):
+                    target_row = row
+
+            # If there is no current job, select the newest one by default.
+            if jobs and target_row is None:
+                target_row = 0
+                self.current_job_id = int(jobs[0].get("id", 0))
+
+            self.jobs_table.clearSelection()
+            if target_row is not None:
+                self.jobs_table.selectRow(target_row)
+                item = self.jobs_table.item(target_row, 0)
+                if item is not None:
+                    self.jobs_table.scrollToItem(
+                        item, QAbstractItemView.ScrollHint.PositionAtTop
+                    )
+        finally:
+            self.jobs_table.blockSignals(was_blocked)
+
+        # Signals were blocked while rebuilding; load the selected job explicitly.
+        if target_row is not None and jobs:
+            selected_job_id = int(jobs[target_row].get("id", 0))
+            self.current_job_id = selected_job_id
+            self._load_containers_for_job(selected_job_id)
 
     def _on_job_selected(self) -> None:
         selected_rows = self.jobs_table.selectionModel().selectedRows()
-        if not selected_rows:
-            return
+        if not selected_rows: return
         row = selected_rows[0].row()
         job_id_item = self.jobs_table.item(row, 0)
-        job_name_item = self.jobs_table.item(row, 1)
-        job_status_item = self.jobs_table.item(row, 3)
         if job_id_item:
             self.current_job_id = int(job_id_item.text())
             self._load_containers_for_job(self.current_job_id)
-            if not self.is_job_running:
-                j_name = job_name_item.text() if job_name_item else ""
-                j_status = job_status_item.text() if job_status_item else ""
-                cnt = self.container_table.rowCount()
-                job_dir = self._resolve_job_output_dir(self.current_job_id)
-                log_file = (job_dir / "logs" / "job_activity.log") if job_dir else None
-                if log_file and log_file.is_file():
-                    try:
-                        full_log = log_file.read_text(encoding="utf-8", errors="ignore")
-                        self.txt_activity_log.setPlainText(full_log)
-                        sb = self.txt_activity_log.verticalScrollBar()
-                        sb.setValue(sb.maximum())
-                        return
-                    except Exception:
-                        pass
-                self.txt_activity_log.setPlainText(
-                    f"=== Riwayat Job #{self.current_job_id}: {j_name} ({j_status}) ===\n"
-                    f"Total Kontainer Terdeteksi: {cnt}\n\n"
-                    f"• Klik baris kontainer di atas untuk melihat Citra RAW, Anotasi, dan Crop ROI.\n"
-                    f"• Gunakan tombol '📁 Buka Folder Hasil' untuk membuka file citra di Windows Explorer.\n"
-                    f"• Gunakan tombol '📥 Ekspor CSV' untuk mengunduh rekap hasil pengenalan kontainer."
-                )
 
     def _load_containers_for_job(self, job_id: int) -> None:
-        out_vid = self._get_job_output_video(job_id)
-        self.btn_play_output.setEnabled(bool(out_vid and Path(out_vid).is_file()))
-
+        self.btn_play_output.setEnabled(bool(self._get_job_output_video(job_id)))
         containers = self.db.get_full_container_view(job_id)
         self.container_table.setRowCount(len(containers))
 
         total_cnt = len(containers)
         valid_cnt = sum(1 for c in containers if c.get("detections", {}).get("container_number", {}).get("is_valid_iso"))
-        invalid_cnt = total_cnt - valid_cnt
-
+        
         if total_cnt > 0:
-            self.lbl_container_summary.setText(f"Total: {total_cnt} | Valid ISO: {valid_cnt} | Perlu Review: {invalid_cnt}")
-            self.lbl_container_summary.setStyleSheet(
-                "color: #107C41; font-weight: bold; background-color: #1b3323; border: 1px solid #107C41; "
-                "border-radius: 4px; padding: 2px 8px; font-size: 11px; margin-left: 8px;"
-            )
+            self.lbl_container_summary.setText(f"Total: {total_cnt} | Valid ISO: {valid_cnt} | Perlu Review: {total_cnt - valid_cnt}")
+            self.lbl_container_summary.setStyleSheet("color: #107C41; font-weight: bold; background-color: #1b3323; border: 1px solid #107C41; border-radius: 4px; padding: 2px 8px; font-size: 11px;")
         else:
-            self.lbl_container_summary.setText("Belum ada kontainer terdeteksi")
-            self.lbl_container_summary.setStyleSheet("color: #888; font-size: 11px; margin-left: 8px;")
+            self.lbl_container_summary.setText("Belum ada data")
+            self.lbl_container_summary.setStyleSheet("color: #888;")
 
         for row, c in enumerate(containers):
             self.container_table.setItem(row, 0, QTableWidgetItem(f"R{c['route_order']:03d}"))
             self.container_table.setItem(row, 1, QTableWidgetItem(str(c["container_id"])))
-
+            
             c_type = c.get("container_type") or "LEFT_RIGHT"
             status_item = QTableWidgetItem(f"{c_type} ({c['status']})")
             status_item.setForeground(QColor("#107C41" if c["status"] == "stable" else "#FF8C00"))
@@ -644,46 +622,61 @@ class MainWindow(QMainWindow):
 
             if c_num_det:
                 is_manual = bool(c_num_det.get("is_reviewed"))
-                
-                # Tampilkan teks manual jika ada, jika tidak pakai hasil OCR
                 if is_manual and c_num_det.get("manual_override_text"):
                     num_text = c_num_det.get("manual_override_text")
                 else:
                     num_text = c_num_det.get("ocr_clean_text") or c_num_det.get("ocr_raw_text") or "-"
-                    
                 conf_val = c_num_det.get("confidence", 0.0)
                 
                 if c_num_det.get("is_valid_iso"):
                     if is_manual:
                         iso_badge = "VALID (Manual Fix)"
-                        badge_color = "#0078D4"  # Biru (koreksi user)
+                        badge_color = "#0078D4"
                     else:
                         iso_badge = "VALID (Auto OCR)"
-                        badge_color = "#107C41"  # Hijau (sistem otomatis)
+                        badge_color = "#107C41"
                 else:
                     iso_badge = "CHECK DIGIT / FORMAT ERROR"
                     badge_color = "#D83B01"
 
-            # Beri warna biru/cyan pada teks nomor jika ini hasil koreksi manual
             num_item = QTableWidgetItem(num_text)
             if c_num_det and c_num_det.get("is_reviewed"):
-                num_item.setForeground(QColor("#4fc1ff")) 
-                orig_text = c_num_det.get("ocr_clean_text") or c_num_det.get("ocr_raw_text") or "-"
-                num_item.setToolTip(f"Manual Override. Sistem membaca: '{orig_text}'")
+                num_item.setForeground(QColor("#4fc1ff"))
             self.container_table.setItem(row, 3, num_item)
 
             badge_item = QTableWidgetItem(iso_badge)
             badge_item.setForeground(QColor(badge_color))
+            badge_item.setToolTip(iso_badge)
             self.container_table.setItem(row, 4, badge_item)
 
-            iso_text = iso_det.get("ocr_clean_text") or iso_det.get("ocr_raw_text") or "-" if iso_det else "-"
+            iso_text = "-"
+            if iso_det:
+                iso_text = iso_det.get("manual_override_text") or iso_det.get("ocr_clean_text") or iso_det.get("ocr_raw_text") or "-"
+            
+            # Jangan tampilkan "-" jika isinya kosong string
+            if iso_text.strip() == "": iso_text = "-"
+            
             self.container_table.setItem(row, 5, QTableWidgetItem(iso_text))
             self.container_table.setItem(row, 6, QTableWidgetItem(f"{conf_val:.2f}" if conf_val > 0 else "-"))
 
-            reviewed = "YES" if (c_num_det and c_num_det.get("is_reviewed")) else "NO"
+            # Manual Review harus mencakup koreksi pada nomor container maupun ISO Code.
+            # ISO Code disimpan sebagai detection terpisah, jadi jangan hanya membaca
+            # flag is_reviewed dari c_num_det.
+            num_reviewed = bool(c_num_det and c_num_det.get("is_reviewed"))
+            iso_reviewed = bool(iso_det and iso_det.get("is_reviewed"))
+            is_reviewed = num_reviewed or iso_reviewed
+            reviewed = "YES" if is_reviewed else "NO"
             rev_item = QTableWidgetItem(reviewed)
-            if reviewed == "YES":
+            if is_reviewed:
                 rev_item.setForeground(QColor("#0078D4"))
+                review_sources = []
+                if num_reviewed:
+                    review_sources.append("Nomor Container")
+                if iso_reviewed:
+                    review_sources.append("ISO Code")
+                rev_item.setToolTip("Koreksi manual tersimpan: " + ", ".join(review_sources))
+            else:
+                rev_item.setToolTip("Belum ada koreksi manual tersimpan")
             self.container_table.setItem(row, 7, rev_item)
 
             self.container_table.item(row, 0).setData(Qt.ItemDataRole.UserRole, c["id"])
@@ -691,19 +684,18 @@ class MainWindow(QMainWindow):
                 self.container_table.item(row, 3).setData(Qt.ItemDataRole.UserRole, c_num_det["id"])
 
         if containers:
-            selected_row_to_restore = 0
+            selected_row = 0
             if self.selected_container_id is not None:
                 for r in range(len(containers)):
                     item = self.container_table.item(r, 0)
                     if item and item.data(Qt.ItemDataRole.UserRole) == self.selected_container_id:
-                        selected_row_to_restore = r
+                        selected_row = r
                         break
-            self.container_table.selectRow(selected_row_to_restore)
+            self.container_table.selectRow(selected_row)
 
     def _on_container_selected(self) -> None:
         selected_rows = self.container_table.selectionModel().selectedRows()
-        if not selected_rows:
-            return
+        if not selected_rows: return
         row = selected_rows[0].row()
 
         c_id = self.container_table.item(row, 0).data(Qt.ItemDataRole.UserRole)
@@ -711,41 +703,38 @@ class MainWindow(QMainWindow):
 
         c_num_item = self.container_table.item(row, 3)
         self.selected_detection_id = c_num_item.data(Qt.ItemDataRole.UserRole) if c_num_item else None
-        # Aktifkan tombol simpan koreksi hanya jika kontainer ini punya data nomor
-        self.btn_save_override.setEnabled(bool(self.selected_detection_id))
         
-        curr_text = c_num_item.text() if c_num_item else ""
-        if curr_text == "-":
-            curr_text = ""
-        self.edit_manual_num.setText(curr_text)
-
         detections = self.db.get_detections_for_container(c_id)
-        c_num_det = next((d for d in detections if d["detection_type"] == "container_number"), None)
-
-        # Tampilkan info perbandingan OCR vs Manual di bar bawah
-        if c_num_det and c_num_det.get("is_reviewed"):
-            orig_text = c_num_det.get("ocr_clean_text") or c_num_det.get("ocr_raw_text") or "-"
-            self.lbl_iso_feedback.setText(f" [Dikoreksi] Sistem membaca: '{orig_text}'")
-            self.lbl_iso_feedback.setStyleSheet("color: #0078D4; font-weight: bold;")
         
+        # Cari ID deteksi ISO
+        self.selected_iso_detection_id = None
+        iso_det = next((d for d in detections if d["detection_type"] == "iso_code"), None)
+        if iso_det:
+            self.selected_iso_detection_id = iso_det["id"]
+        
+        self.btn_save_override.setEnabled(bool(self.selected_detection_id))
+        self.btn_save_iso.setEnabled(True) # Selalu izinkan koreksi ISO jika kontainer dipilih
+        
+        self.edit_manual_num.setText(c_num_item.text() if c_num_item and c_num_item.text() != "-" else "")
+        
+        iso_text = "-"
+        if iso_det:
+            iso_text = iso_det.get("manual_override_text") or iso_det.get("ocr_clean_text") or iso_det.get("ocr_raw_text") or "-"
+            if iso_text.strip() == "": iso_text = "-"
+        self.edit_manual_iso.setText(iso_text if iso_text != "-" else "")
+
         containers = [c for c in self.db.get_containers_for_job(self.current_job_id or 0) if c["id"] == c_id]
-        if not containers:
-            return
+        if not containers: return
         c_info = containers[0]
 
         pano_path = c_info.get("annotated_image_path") or c_info.get("image_path")
         if pano_path and Path(pano_path).is_file():
             pix = QPixmap(pano_path)
-            scaled = pix.scaled(
-                self.lbl_pano_img.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
+            scaled = pix.scaled(self.lbl_pano_img.size(), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             self.lbl_pano_img.setPixmap(scaled)
         else:
-            self.lbl_pano_img.setText("Citra panorama sedang diproses oleh Stitching Engine (ALIKED)...")
+            self.lbl_pano_img.setText("Citra panorama tidak ditemukan.")
 
-        # Reset gambar & pixmap asli sebelum memuat yang baru
         self.lbl_crop_num.setText("Crop nomor tidak tersedia")
         self.lbl_crop_num.setPixmap(QPixmap())
         self.lbl_crop_iso.setText("Crop ISO code tidak tersedia")
@@ -765,30 +754,70 @@ class MainWindow(QMainWindow):
                     self._render_crop_image("iso")
 
     def _render_crop_image(self, target: str):
-        """Merender gambar crop ke label dengan scaling yang tepat."""
         pixmap = self._orig_crop_num_pixmap if target == "num" else self._orig_crop_iso_pixmap
         label = self.lbl_crop_num if target == "num" else self.lbl_crop_iso
-
         if pixmap and not pixmap.isNull():
-            scaled = pixmap.scaled(
-                QSize(300, 120),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
+            scaled = pixmap.scaled(QSize(220, 90), Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
             label.setPixmap(scaled)
         else:
             label.setText("Crop tidak tersedia")
 
     def _rotate_crop(self, target: str, angle: int):
-        """Memutar gambar crop sesuai sudut yang diminta (kiri/kanan)."""
         if target == "num" and self._orig_crop_num_pixmap:
-            transform = QTransform().rotate(angle)
-            self._orig_crop_num_pixmap = self._orig_crop_num_pixmap.transformed(transform)
+            self._orig_crop_num_pixmap = self._orig_crop_num_pixmap.transformed(QTransform().rotate(angle))
             self._render_crop_image("num")
         elif target == "iso" and self._orig_crop_iso_pixmap:
-            transform = QTransform().rotate(angle)
-            self._orig_crop_iso_pixmap = self._orig_crop_iso_pixmap.transformed(transform)
+            self._orig_crop_iso_pixmap = self._orig_crop_iso_pixmap.transformed(QTransform().rotate(angle))
             self._render_crop_image("iso")
+
+    def _on_re_ocr_crop(self, target: str) -> None:
+        if target == "num":
+            det_id = self.selected_detection_id
+            det_type = "container_number"
+            pixmap = self._orig_crop_num_pixmap
+        else:
+            det_id = self.selected_iso_detection_id
+            det_type = "iso_code"
+            pixmap = self._orig_crop_iso_pixmap
+
+        if not det_id:
+            QMessageBox.warning(self, "Peringatan", f"Data deteksi {det_type} belum ada di database. Gunakan koreksi manual.")
+            return
+        if not pixmap or pixmap.isNull():
+            QMessageBox.warning(self, "Peringatan", "Gambar crop tidak tersedia untuk di-OCR ulang!")
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Konfirmasi OCR Ulang",
+            f"Jalankan OCR ulang untuk {det_type.replace('_', ' ')}?\n\n"
+            "Hasil OCR terbaru akan menggantikan hasil OCR sebelumnya. Lanjutkan?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        temp_dir = Path(BASE_DIR) / "data" / "temp_crops"
+        temp_dir.mkdir(parents=True, exist_ok=True)
+        temp_file = temp_dir / f"reocr_{det_type}_{det_id}.png"
+        
+        if not pixmap.save(str(temp_file), "PNG"):
+            QMessageBox.critical(self, "Error", "Gagal menyimpan gambar sementara!")
+            return
+
+        btn = self.btn_reocr_num if target == "num" else self.btn_reocr_iso
+        btn.setEnabled(False)
+        btn.setText("⏳ Memproses...")
+
+        self.cmd_queue.put({
+            "action": "RE_OCR_CROP",
+            "detection_id": det_id,
+            "job_id": self.current_job_id,
+            "image_path": str(temp_file),
+            "detection_type": det_type,
+        })
+        self.show_toast(f"Mengirim crop {det_type} ke OCR...", "info")
 
     def _on_manual_text_changed(self, text: str) -> None:
         res = validate_iso6346(text)
@@ -807,173 +836,120 @@ class MainWindow(QMainWindow):
         if not self.selected_detection_id:
             QMessageBox.warning(self, "Peringatan", "Pilih kontainer yang memiliki data nomor terlebih dahulu!")
             return
-
         text = self.edit_manual_num.text().strip().upper()
         if not text:
             QMessageBox.warning(self, "Peringatan", "Nomor kontainer tidak boleh kosong!")
             return
-
+        confirm = QMessageBox.question(
+            self,
+            "Konfirmasi Koreksi Manual",
+            f"Simpan nomor container berikut sebagai koreksi manual?\n\n{text}\n\n"
+            "Status Manual Review akan menjadi YES.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
         self.btn_save_override.setEnabled(False)
         self.btn_save_override.setText("Menyimpan...")
-
         self.cmd_queue.put({
             "action": "MANUAL_OVERRIDE",
             "detection_id": self.selected_detection_id,
             "text": text,
-            "job_id": self.current_job_id, # Agar orchestrator tahu job id-nya
+            "job_id": self.current_job_id,
         })
+
+    def _on_manual_iso_text_changed(self, text: str) -> None:
+        if not text:
+            self.lbl_iso_feedback_iso.setText("-")
+            self.lbl_iso_feedback_iso.setStyleSheet("color: #888;")
+            return
+        is_valid, clean_code, err_msg = validate_iso_size_type(text)
+        if is_valid:
+            self.lbl_iso_feedback_iso.setText(" Format Sesuai (ISO 6346)")
+            self.lbl_iso_feedback_iso.setStyleSheet("color: #107C41; font-weight: bold;")
+        else:
+            self.lbl_iso_feedback_iso.setText(f" Tidak Valid: {err_msg}")
+            self.lbl_iso_feedback_iso.setStyleSheet("color: #D83B01; font-weight: bold;")
+
+    def _on_save_manual_iso(self) -> None:
+        if not self.selected_container_id:
+            QMessageBox.warning(self, "Peringatan", "Klik baris kontainer di tabel terlebih dahulu!")
+            return
+
+        text = self.edit_manual_iso.text().strip().upper()
+        is_valid, clean_code, err_msg = validate_iso_size_type(text)
+        
+        if not is_valid:
+            QMessageBox.warning(self, "Format Salah", f"ISO Code tidak valid:\n{err_msg}")
+            return
+
+        confirm = QMessageBox.question(
+            self,
+            "Konfirmasi Koreksi ISO",
+            f"Simpan ISO Code berikut sebagai koreksi manual?\n\n{clean_code}\n\n"
+            "Status Manual Review akan menjadi YES.",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+
+        self.btn_save_iso.setEnabled(False)
+        self.btn_save_iso.setText("Menyimpan...")
+
+        self.cmd_queue.put({
+            "action": "MANUAL_ISO_OVERRIDE",
+            "container_id": self.selected_container_id, 
+            "text": clean_code,
+            "job_id": self.current_job_id,
+        })
+        self.show_toast(f"Menyimpan koreksi ISO: {clean_code}...", "info")
 
     def _on_play_input_video(self) -> None:
         if not self.selected_video_path or not Path(self.selected_video_path).is_file():
-            QMessageBox.warning(self, "Peringatan", "Silakan pilih file video drone terlebih dahulu!")
+            QMessageBox.warning(self, "Peringatan", "Pilih video drone terlebih dahulu!")
             return
-        if hasattr(self, "_active_video_dlg") and self._active_video_dlg is not None:
-            try:
-                self._active_video_dlg.close()
-            except Exception:
-                pass
-            self._active_video_dlg = None
-
-        try:
-            self._active_video_dlg = VideoPlayerDialog(
-                self,
-                self.selected_video_path,
-                f"Pemutar Video Drone (Input) - {Path(self.selected_video_path).name}",
-            )
-            self._active_video_dlg.exec()
-        except Exception as e:
-            QMessageBox.critical(self, "Error Pemutar Video", f"Gagal memutar video:\n{e}\n\nAnda dapat membuka file langsung dengan pemutar default Windows.")
-        finally:
-            self._active_video_dlg = None
+        dlg = VideoPlayerDialog(self, self.selected_video_path, f"Input - {Path(self.selected_video_path).name}")
+        dlg.exec()
 
     def _on_play_output_video(self) -> None:
-        if not self.current_job_id:
-            QMessageBox.information(self, "Informasi", "Silakan pilih job pada tabel riwayat terlebih dahulu.")
-            return
+        if not self.current_job_id: return
         out_vid = self._get_job_output_video(self.current_job_id)
-        if not out_vid or not Path(out_vid).is_file():
-            QMessageBox.information(
-                self,
-                "Informasi",
-                "Video hasil anotasi belum tersedia untuk job ini.\n"
-                "(Video otomatis dirender dan disimpan dalam folder sesi setelah pemrosesan selesai).",
-            )
+        if not out_vid:
+            QMessageBox.information(self, "Info", "Video hasil belum tersedia.")
             return
-        if hasattr(self, "_active_video_dlg") and self._active_video_dlg is not None:
-            try:
-                self._active_video_dlg.close()
-            except Exception:
-                pass
-            self._active_video_dlg = None
-
-        try:
-            self._active_video_dlg = VideoPlayerDialog(
-                self,
-                out_vid,
-                f"Pemutar Video Hasil Anotasi - Job #{self.current_job_id}",
-            )
-            self._active_video_dlg.exec()
-        except Exception as e:
-            QMessageBox.critical(self, "Error Pemutar Video", f"Gagal memutar video:\n{e}\n\nAnda dapat membuka file langsung dengan pemutar default Windows.")
-        finally:
-            self._active_video_dlg = None
-
-    def _resolve_job_output_dir(self, job_id: int) -> Optional[Path]:
-        """Resolves the session output directory for a job across DB output_video_path, images, or folder name."""
-        out_dir = self.config.paths.resolved_output_dir()
-        jobs = [j for j in self.db.get_all_jobs() if j["id"] == job_id]
-        if jobs and jobs[0].get("output_video_path"):
-            p = Path(jobs[0]["output_video_path"])
-            if p.parent.is_dir():
-                return p.parent
-
-        containers = self.db.get_containers_for_job(job_id)
-        for c in containers:
-            img_p_str = c["image_path"] if isinstance(c, dict) else getattr(c, "image_path", None)
-            if img_p_str:
-                p = Path(img_p_str).resolve()
-                for parent in [p] + list(p.parents):
-                    if parent.parent.resolve() == out_dir.resolve():
-                        return parent
-
-        if jobs:
-            v_stem = Path(jobs[0].get("video_path", "")).stem
-            j_name = jobs[0].get("name", "")
-            for pat in [f"*_{v_stem}" if v_stem else "", f"*_{j_name}" if j_name else ""]:
-                if not pat:
-                    continue
-                candidates = sorted(out_dir.glob(pat), key=lambda x: x.stat().st_mtime, reverse=True)
-                if candidates:
-                    return candidates[0]
-        return None
+        dlg = VideoPlayerDialog(self, out_vid, f"Hasil Anotasi - Job #{self.current_job_id}")
+        dlg.exec()
 
     def _get_job_output_video(self, job_id: int) -> Optional[str]:
         jobs = [j for j in self.db.get_all_jobs() if j["id"] == job_id]
         if jobs and jobs[0].get("output_video_path"):
             p = Path(jobs[0]["output_video_path"])
-            if p.is_file():
-                return str(p)
-        job_dir = self._resolve_job_output_dir(job_id)
-        if job_dir:
-            vids = list(job_dir.glob("*_annotated.mp4"))
-            if vids:
-                return str(vids[0])
+            if p.is_file(): return str(p)
         return None
 
     def _on_open_output_folder(self) -> None:
-        """Opens the output directory of the selected or active job in Windows File Explorer."""
         out_dir = self.config.paths.resolved_output_dir()
-        target_dir = out_dir
-
-        try:
-            if self.current_job_id:
-                resolved = self._resolve_job_output_dir(self.current_job_id)
-                if resolved:
-                    target_dir = resolved
-        except Exception as e:
-            print(f"[WARN] Error resolving job output directory: {e}")
-
-        target_dir.mkdir(parents=True, exist_ok=True)
-
         try:
             import os
-            os.startfile(str(target_dir))
-        except Exception:
-            try:
-                import subprocess
-                subprocess.Popen(["explorer", str(target_dir)])
-            except Exception as e2:
-                QMessageBox.warning(self, "Buka Folder", f"Gagal membuka folder:\n{target_dir}\n\nError: {e2}")
+            os.startfile(str(out_dir))
+        except Exception as e:
+            QMessageBox.warning(self, "Buka Folder", f"Gagal membuka folder:\n{out_dir}\n\nError: {e}")
 
     def _on_export_csv(self) -> None:
-        """Exports the container table of the selected job to a CSV report."""
-        if not self.current_job_id:
-            QMessageBox.information(self, "Ekspor CSV", "Silakan pilih job pada tabel riwayat terlebih dahulu.")
-            return
+        if not self.current_job_id: return
         containers = self.db.get_full_container_view(self.current_job_id)
         if not containers:
-            QMessageBox.information(self, "Ekspor CSV", "Tidak ada data kontainer pada job ini.")
+            QMessageBox.information(self, "Ekspor CSV", "Tidak ada data.")
             return
-
-        default_name = f"hasil_ocr_job_{self.current_job_id}.csv"
-        file_path, _ = QFileDialog.getSaveFileName(self, "Simpan Laporan CSV", default_name, "CSV Files (*.csv)")
-        if not file_path:
-            return
-
+        file_path, _ = QFileDialog.getSaveFileName(self, "Simpan CSV", f"hasil_ocr_job_{self.current_job_id}.csv", "CSV Files (*.csv)")
+        if not file_path: return
         import csv
         try:
             with open(file_path, "w", newline="", encoding="utf-8-sig") as f:
                 writer = csv.writer(f)
-                writer.writerow([
-                    "Region",
-                    "Container ID",
-                    "Mode / Status",
-                    "Nomor Kontainer (OCR)",
-                    "ISO 6346 Check",
-                    "ISO Code",
-                    "Confidence",
-                    "Manual Review",
-                ])
+                writer.writerow(["Region", "Container ID", "Mode / Status", "Nomor Kontainer", "ISO Check", "ISO Code", "Conf", "Manual Review"])
                 for c in containers:
                     c_num = c.get("detections", {}).get("container_number", {})
                     iso_d = c.get("detections", {}).get("iso_code", {})
@@ -984,52 +960,31 @@ class MainWindow(QMainWindow):
                     else:
                         iso_check = "INVALID"
                         
-                    iso_code = iso_d.get("ocr_clean_text") or "-"
+                    iso_code = iso_d.get("manual_override_text") or iso_d.get("ocr_clean_text") or "-"
                     conf = f"{c_num.get('confidence', 0.0):.2f}"
-                    rev = "YES" if c_num.get("is_reviewed") else "NO"
-                    writer.writerow([
-                        f"R{c['route_order']:03d}",
-                        c["container_id"],
-                        c.get("container_type", "FRONT_REAR"),
-                        num_text,
-                        iso_check,
-                        iso_code,
-                        conf,
-                        rev,
-                    ])
-            QMessageBox.information(self, "Sukses", f"Data berhasil diekspor ke:\n{file_path}")
+                    rev = "YES" if c_num.get("is_reviewed") or iso_d.get("is_reviewed") else "NO"
+                    writer.writerow([f"R{c['route_order']:03d}", c["container_id"], c.get("container_type", "-"), num_text, iso_check, iso_code, conf, rev])
+            QMessageBox.information(self, "Sukses", f"Data diekspor ke:\n{file_path}")
         except Exception as e:
-            QMessageBox.critical(self, "Gagal Ekspor", f"Terjadi kesalahan saat menyimpan CSV:\n{e}")
+            QMessageBox.critical(self, "Gagal", f"Error: {e}")
 
     def _open_settings(self) -> None:
-        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-        try:
-            dlg = SettingsDialog(self.config, self)
-        finally:
-            QApplication.restoreOverrideCursor()
+        dlg = SettingsDialog(self.config, self)
         if dlg.exec():
             self.cmd_queue.put({"action": "UPDATE_CONFIG", "config": self.config.to_dict()})
-            dev_lbl = str(getattr(self.config.stitching, "device", "cpu")).upper()
-            self.show_toast(f"Pengaturan berhasil disimpan (Mode Komputasi: {dev_lbl}).", "success")
+            self.show_toast(f"Pengaturan disimpan.", "success")
 
     def _on_logout(self) -> None:
-        reply = QMessageBox.question(
-            self,
-            "Konfirmasi Logout",
-            "Apakah Anda yakin ingin keluar dari sesi akun ini?",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
+        reply = QMessageBox.question(self, "Logout", "Yakin ingin keluar?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
         if reply == QMessageBox.StandardButton.Yes:
             from src.ui.login_dialog import LoginDialog
             from src.utils.security import store_auth_token
-
             store_auth_token("")
             self.hide()
             dlg = LoginDialog(self.config, self)
             if dlg.exec() == LoginDialog.DialogCode.Accepted:
                 self.show()
-                self.show_toast("Berhasil masuk dengan akun baru.", "info")
+                self.show_toast("Berhasil masuk.", "info")
             else:
                 self.close()
 
@@ -1042,39 +997,18 @@ class MainWindow(QMainWindow):
             self._toasts.reposition()
 
     def closeEvent(self, event) -> None:
-        """Handles application shutdown cleanly according to TDD v1.9."""
         if self.is_job_running:
-            reply = QMessageBox.question(
-                self,
-                "Konfirmasi Keluar",
-                "Job pemrosesan sedang berlangsung!\n\nApakah Anda ingin membatalkan job aktif dan keluar?\n(Job yang terhenti dapat di-resume kembali saat aplikasi dibuka)",
-                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                QMessageBox.StandardButton.No,
-            )
+            reply = QMessageBox.question(self, "Keluar", "Job berjalan. Batalkan dan keluar?", QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
             if reply != QMessageBox.StandardButton.Yes:
                 event.ignore()
                 return
-            if self.orchestrator:
-                self.orchestrator.cancel_current_job()
-
-        if hasattr(self, "_active_video_dlg") and self._active_video_dlg is not None:
-            try:
-                self._active_video_dlg.close()
-            except Exception:
-                pass
-            self._active_video_dlg = None
+            if self.orchestrator: self.orchestrator.cancel_current_job()
 
         if hasattr(self, "event_timer") and self.event_timer.isActive():
             self.event_timer.stop()
-
         if hasattr(self, "cmd_queue") and self.cmd_queue is not None:
-            try:
-                self.cmd_queue.put({"action": "STOP"})
-            except Exception:
-                pass
-
+            try: self.cmd_queue.put({"action": "STOP"})
+            except Exception: pass
         event.accept()
-
         app_inst = QApplication.instance()
-        if app_inst:
-            app_inst.quit()
+        if app_inst: app_inst.quit()
