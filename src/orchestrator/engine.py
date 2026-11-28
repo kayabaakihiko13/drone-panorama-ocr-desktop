@@ -237,10 +237,10 @@ class Orchestrator(threading.Thread):
         h, rem = divmod(secs, 3600)
         m, s = divmod(rem, 60)
         if h > 0:
-            return f"{h}j {m:02d}m {s:02d}d"
+            return f"{h}j {m:02d}m {s:02d}s"
         if m > 0:
-            return f"{m}m {s:02d}d"
-        return f"{s}d"
+            return f"{m}m {s:02d}s"
+        return f"{s}s"
 
     def _write_log_raw(self, text: str) -> None:
         log_p = self._active_log_path
@@ -435,6 +435,24 @@ class Orchestrator(threading.Thread):
         self._current_job_id = job_id
         self._cancel_requested.clear()
         self.db.update_job_status(job_id, "PROCESSING")
+
+        model_path = self.config.detection.resolved_model_path()
+        if not model_path.is_file():
+            error_msg = (
+                f"Model deteksi tidak ditemukan: {model_path}. "
+                "Pastikan file container_detection_model.onnx tersedia pada folder weight."
+            )
+            self.db.update_job_status(job_id, "FAILED", error_message=error_msg)
+            self.db.log_audit("ERROR", f"Job {job_id} gagal: {error_msg}", job_id=job_id)
+            self._emit_event(
+                OrchestratorEvent(
+                    type="JOB_FAILED",
+                    job_id=job_id,
+                    data={"error": error_msg},
+                )
+            )
+            self._current_job_id = None
+            return
 
         job_start_dt = datetime.now()
         video_stem = Path(video_path).stem or f"job_{job_id}"

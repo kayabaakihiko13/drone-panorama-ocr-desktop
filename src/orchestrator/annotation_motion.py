@@ -10,6 +10,9 @@ import cv2
 import numpy as np
 
 
+from src.video.ffmpeg_writer import FFmpegWriter
+
+
 Box = Tuple[float, float, float, float]
 
 
@@ -26,6 +29,22 @@ def box_iou(boxA: Box, boxB: Box) -> float:
     areaA = max(1e-6, (boxA[2] - boxA[0]) * (boxA[3] - boxA[1]))
     areaB = max(1e-6, (boxB[2] - boxB[0]) * (boxB[3] - boxB[1]))
     return interArea / float(areaA + areaB - interArea)
+
+def _build_banner_cache(overlays:list,sf:float,fscale:float,fthick:int,color_container):
+    """Pre-render semua banner label sekali per render call."""
+    cache: dict[str, "np.ndarray"] = {}
+    tag_h = max(1, int(18 * sf))
+    for ov in overlays:
+        tag_w = max(1, int((len(ov.label) * 8.5 + 10) * sf))
+        sprite = np.zeros((tag_h, tag_w, 3), dtype=np.uint8)
+        sprite[:] = color_container
+        cv2.putText(
+            sprite, ov.label,
+            (int(3 * sf), max(int(13 * sf), tag_h - int(4 * sf))),
+            cv2.FONT_HERSHEY_SIMPLEX, fscale, (0, 0, 0), fthick, cv2.LINE_AA,
+        )
+        cache[ov.label] = sprite
+    return cache
 
 
 # --------------------------------------------------------------------------
@@ -964,6 +983,7 @@ def _compute_roi_lk_tracks(
     total_frames: int,
     work_width: int = 960,
     max_edge_extend: int = 260,
+    frame_stride: int = 2,
     cancel: Optional[Callable[[], bool]] = None,
     progress_callback: Optional[Callable[[float, str], None]] = None,
 ) -> None:
@@ -1095,10 +1115,16 @@ def _compute_roi_lk_tracks(
 
                     # Propagate from previous frame f-1 -> f if active
                     if s["cur_cb"] is not None and not s["fwd_done"] and prev_gray is not None:
-                        (dx, dy), (ndx, ndy) = _roi_pair_step(
-                            prev_gray, g, s["cur_cb"], s["cur_nb"], w0, h0, work_width, hs, s["last_v"]
-                        )
-                        s["last_v"] = (dx, dy)
+                        if (f % frame_stride) == 0:
+                            # LK penuh (forward-backward check)
+                            (dx, dy), (ndx, ndy) = _roi_pair_step(
+                                prev_gray, g, s["cur_cb"], s["cur_nb"], w0, h0, work_width, hs, s["last_v"]
+                            )
+                            s["last_v"] = (dx, dy)
+                        else:
+                            # Frame di-skip: pakai velocity dari frame sebelumnya (containers move smoothly)
+                            dx, dy = s["last_v"]
+                            ndx, ndy = s["last_v"]
                         pred_cb = _shift_box(s["cur_cb"], dx, dy)
                         pred_nb = _shift_box(s["cur_nb"], ndx, ndy)
                         s["raw_fwd_cb"][f] = pred_cb
@@ -1169,6 +1195,12 @@ def _compute_roi_lk_tracks(
                                     break
                                 if rf >= fa:
                                     continue
+                                if (cur_bf - rf) % frame_stride != 0:
+                                    # skip LK, hanya shift dengan last velocity
+                                    b_cb = _shift_box(b_cb, b_last_v[0], b_last_v[1])
+                                    b_nb = _shift_box(b_nb, b_last_v[0], b_last_v[1])
+                                    ov._resolved_cont[rf] = b_cb
+                                    ov._resolved_num[rf] = b_nb
                                 (dx, dy), (ndx, ndy) = _roi_pair_step(
                                     cur_bg, rg, b_cb, b_nb, w0, h0, work_width, hs, b_last_v
                                 )
@@ -1263,6 +1295,7 @@ def render_overlay_video(
     target_h: Optional[int] = None,
     cancel: Optional[Callable[[], bool]] = None,
     progress_callback: Optional[Callable[[float, str], None]] = None,
+    roi_work_width: int = 640,          # NEW — turun dari 960 default
 ) -> bool:
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -1273,17 +1306,16 @@ def render_overlay_video(
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 1)
     cap.release()
 
-    # Compute ROI-local FB-LK tracks across entire entry-to-exit lifespans before writing video
     if overlays:
         _compute_roi_lk_tracks(
             video_path=str(video_path),
             overlays=overlays,
-            w0=w0,
-            h0=h0,
-            total_frames=total_frames,
+            w0=w0, h0=h0, total_frames=total_frames,
+            work_width=roi_work_width,        # ← passing param baru
             cancel=cancel,
             progress_callback=(
-                (lambda pct, msg: progress_callback(pct * 0.35, msg)) if progress_callback else None
+                (lambda pct, msg: progress_callback(pct * 0.35, msg))
+                if progress_callback else None
             ),
         )
 
@@ -1301,13 +1333,17 @@ def render_overlay_video(
     sf = max(0.8, th / 720.0)
     line = max(1, int(1.8 * sf))
     fscale, fthick = 0.42 * sf, (1 if sf < 1.4 else 2)
-    color_container = (50, 205, 50)  # Hijau kontainer
-    color_badge = (255, 255, 0)      # Cyan nomor kontainer
+    color_container = (50, 205, 50)
+    color_badge = (255, 255, 0)
 
-    writer = cv2.VideoWriter(str(out_path), cv2.VideoWriter_fourcc(*"mp4v"), fps, (tw, th))
+    # Pre-render semua banner label (dipakai setiap frame)
+    banner_cache = _build_banner_cache(overlays, sf, fscale, fthick, color_container)
+
+    writer = FFmpegWriter(str(out_path), tw, th, fps, crf=23)
     if not writer.isOpened():
         cap.release()
         return False
+
     f = 0
     try:
         while True:
@@ -1323,69 +1359,54 @@ def render_overlay_video(
                 cb = ov.container_box_at(f, C, w0, h0)
                 b = ov.box_at(f, C, w0, h0)
 
-                # 1. Kotak Hijau Badan Kontainer + Banner Header
+                # 1. Kotak hijau + banner label (dari cache, tanpa putText)
                 if cb is not None:
-                    cx1 = int(round(cb[0] * sx))
-                    cy1 = int(round(cb[1] * sy))
-                    cx2 = int(round(cb[2] * sx))
-                    cy2 = int(round(cb[3] * sy))
+                    cx1 = int(round(cb[0] * sx)); cy1 = int(round(cb[1] * sy))
+                    cx2 = int(round(cb[2] * sx)); cy2 = int(round(cb[3] * sy))
                     cv2.rectangle(frame, (cx1, cy1), (cx2, cy2), color_container, line)
 
-                    tag_h = int(18 * sf)
-                    tag_w_est = int((len(ov.label) * 8.5 + 10) * sf)
-                    tx1 = max(0, min(tw - tag_w_est, cx1))
-                    tx2 = min(tw, tx1 + tag_w_est)
-                    by1 = max(0, cy1 - tag_h)
-                    by2 = max(by1 + 1, cy1)
-                    if by2 <= by1:
-                        by2 = min(th, by1 + tag_h)
-                    cv2.rectangle(frame, (tx1, by1), (tx2, by2), color_container, -1)
-                    cv2.putText(
-                        frame,
-                        ov.label,
-                        (tx1 + int(3 * sf), min(th - 2, max(int(13 * sf), by2 - int(4 * sf)))),
-                        cv2.FONT_HERSHEY_SIMPLEX,
-                        fscale,
-                        (0, 0, 0),
-                        fthick,
-                        cv2.LINE_AA,
-                    )
+                    sprite = banner_cache.get(ov.label)
+                    if sprite is not None:
+                        sh, sw = sprite.shape[:2]
+                        tx1 = max(0, min(tw - sw, cx1))
+                        by1 = max(0, cy1 - sh)
+                        tx2 = min(tw, tx1 + sw)
+                        by2 = min(th, by1 + sh)
+                        if by2 > by1 and tx2 > tx1:
+                            frame[by1:by2, tx1:tx2] = sprite[:by2 - by1, :tx2 - tx1]
 
-                # 2. Kotak Cyan Area Nomor Kontainer
+                # 2. Kotak cyan nomor kontainer
                 if b is not None and (b[2] - b[0]) >= 6.0 and (b[3] - b[1]) >= 6.0:
-                    bx1 = int(round(b[0] * sx))
-                    by1 = int(round(b[1] * sy))
-                    bx2 = int(round(b[2] * sx))
-                    by2 = int(round(b[3] * sy))
+                    bx1 = int(round(b[0] * sx)); by1 = int(round(b[1] * sy))
+                    bx2 = int(round(b[2] * sx)); by2 = int(round(b[3] * sy))
                     cv2.rectangle(frame, (bx1, by1), (bx2, by2), color_badge, line)
 
+                    # Banner fallback kalau kontainer tidak terdeteksi (tapi nomor ada)
                     if cb is None:
-                        tag_h = int(18 * sf)
-                        tag_w_est = max(bx2 - bx1, int((len(ov.label) * 8.5 + 8) * sf))
-                        tx1 = max(0, min(tw - tag_w_est, bx1))
-                        tx2 = min(tw, tx1 + tag_w_est)
-                        lbl_y1 = max(0, by1 - tag_h)
-                        lbl_y2 = max(lbl_y1 + tag_h, by1)
-                        cv2.rectangle(frame, (tx1, lbl_y1), (tx2, lbl_y2), color_container, -1)
-                        cv2.putText(
-                            frame,
-                            ov.label,
-                            (tx1 + int(3 * sf), min(th - 2, max(int(13 * sf), lbl_y2 - int(4 * sf)))),
-                            cv2.FONT_HERSHEY_SIMPLEX,
-                            fscale,
-                            (0, 0, 0),
-                            fthick,
-                            cv2.LINE_AA,
-                        )
+                        sprite = banner_cache.get(ov.label)
+                        if sprite is not None:
+                            sh, sw = sprite.shape[:2]
+                            tx1 = max(0, min(tw - sw, bx1))
+                            ly1 = max(0, by1 - sh)
+                            tx2 = min(tw, tx1 + sw)
+                            ly2 = min(th, ly1 + sh)
+                            if ly2 > ly1 and tx2 > tx1:
+                                frame[ly1:ly2, tx1:tx2] = sprite[:ly2 - ly1, :tx2 - tx1]
 
             writer.write(frame)
             f += 1
             if progress_callback and f % 10 == 0:
                 base_p = 0.35 if overlays else 0.0
                 scale_p = 0.65 if overlays else 1.0
-                progress_callback(base_p + scale_p * min(1.0, f / float(max(1, total_frames))), f"Render video anotasi ({f}/{total_frames})...")
+                progress_callback(
+                    base_p + scale_p * min(1.0, f / float(max(1, total_frames))),
+                    f"Render video anotasi ({f}/{total_frames})...",
+                )
     finally:
         cap.release()
-        writer.release()
+        try:
+            writer.release()
+        except Exception as e:
+            print(f"[VIDEO EXPORT] ffmpeg finalize error: {e}")
 
     return True

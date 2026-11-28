@@ -21,7 +21,6 @@ from PySide6.QtWidgets import (
 from src.config import BASE_DIR, AppConfig
 from src.database.db import Database
 from src.orchestrator.engine import Orchestrator, OrchestratorEvent
-from src.recognition.detector import describe_compute_plan
 from src.ui.settings_dialog import SettingsDialog
 from src.ui.toast import ElidedLabel, ToastManager
 from src.ui.video_player_dialog import VideoPlayerDialog
